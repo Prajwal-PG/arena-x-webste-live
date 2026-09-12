@@ -946,10 +946,11 @@
         async function loadLiveRegistrations() {
             try {
                 const res = await fetch('/api/registrations');
-                if (res.status === 401) {
-                    window.location.reload();
+                if (res.status === 401 && !isStaticMode) {
+                    showLoginView();
                     return;
                 }
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const data = await res.json();
                 if (data.success) {
                     allRegistrations = data.registrations || [];
@@ -958,6 +959,42 @@
                 }
             } catch(e) {
                 console.error("Error loading registrations:", e);
+                if (isStaticMode && (!allRegistrations || allRegistrations.length === 0)) {
+                    allRegistrations = [
+                        {
+                            id: 1,
+                            team_name: "CYBER DRAGONS",
+                            captain_name: "Prajwal PG",
+                            selected_game: "Valorant",
+                            phone: "+91 9632302188",
+                            alt_phone: "+91 9632302188",
+                            email: "prajwalzone68@gmail.com",
+                            gamer_uid: "#12345",
+                            bms_booking_id: "WXYZ123456",
+                            status: "VERIFIED",
+                            checkin_status: "CHECKED_IN",
+                            created_at: new Date().toISOString(),
+                            screenshot_url: "dummy_zomato_booking.png"
+                        },
+                        {
+                            id: 2,
+                            team_name: "NEON STRIKERS",
+                            captain_name: "Rahul K",
+                            selected_game: "BGMI",
+                            phone: "+91 9876543210",
+                            alt_phone: "+91 9876543211",
+                            email: "rahul.striker@gmail.com",
+                            gamer_uid: "5123984712",
+                            bms_booking_id: "BMS789012",
+                            status: "PENDING_VERIFICATION",
+                            checkin_status: "NOT_CHECKED_IN",
+                            created_at: new Date().toISOString(),
+                            screenshot_url: "dummy_zomato_booking.png"
+                        }
+                    ];
+                    updateStats();
+                    filterTable();
+                }
             }
         }
 
@@ -2073,7 +2110,7 @@ You can also use the 'Photo / Scan File' button to take a photo of the QR code w
             }
 
             // Initialize Dashboard Data
-            if (typeof loadRegistrations === 'function') loadRegistrations();
+            if (typeof loadLiveRegistrations === 'function') loadLiveRegistrations();
             if (typeof loadAdminMatches === 'function') loadAdminMatches();
             if (typeof loadGameStatuses === 'function') loadGameStatuses();
             if (typeof loadAdminAnnouncements === 'function') loadAdminAnnouncements();
@@ -2146,7 +2183,11 @@ You can also use the 'Photo / Scan File' button to take a photo of the QR code w
             showLoginView();
         }
 
-        window.addEventListener('DOMContentLoaded', checkExistingAuth);
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', checkExistingAuth);
+        } else {
+            checkExistingAuth();
+        }
     </script>
 </body>
 </html>
