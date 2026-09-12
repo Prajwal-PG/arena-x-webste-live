@@ -1097,11 +1097,13 @@
                 }
             } catch(e) {
                 console.error("Error loading registrations:", e);
-                if (isStaticMode && (!allRegistrations || allRegistrations.length === 0)) {
+                try {
+                    allRegistrations = JSON.parse(localStorage.getItem('arena_local_registrations') || '[]');
+                } catch(errLS) {
                     allRegistrations = [];
-                    updateStats();
-                    filterTable();
                 }
+                updateStats();
+                filterTable();
             }
         }
 
