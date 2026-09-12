@@ -1,0 +1,48 @@
+[Unit]
+Description=ARENA X 2026 Web Portal Backend (Flask + Gunicorn)
+After=network.target redis-server.service
+Wants=redis-server.service
+
+[Service]
+Type=notify
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/arena_x
+EnvironmentFile=/var/www/arena_x/.env
+Environment="PATH=/var/www/arena_x/venv/bin"
+
+ExecStart=/var/www/arena_x/venv/bin/gunicorn \
+    --workers 2 \
+    --bind 127.0.0.1:5000 \
+    --timeout 60 \
+    --keep-alive 5 \
+    --access-logfile /var/log/arena_x/access.log \
+    --error-logfile /var/log/arena_x/error.log \
+    --capture-output \
+    --enable-stdio-inheritance \
+    wsgi:app
+
+Restart=always
+RestartSec=5s
+KillMode=mixed
+TimeoutStopSec=30
+
+# Security Sandboxing & Least Privilege Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+CapabilityBoundingSet=
+
+# Explicit ReadWritePaths for application runtime state
+ReadWritePaths=/var/www/arena_x/data /var/www/arena_x/uploads /var/log/arena_x /tmp
+
+[Install]
+WantedBy=multi-user.target

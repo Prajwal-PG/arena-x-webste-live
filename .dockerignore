@@ -1,0 +1,59 @@
+# ==========================================
+# ARENA X 2026 // DOCKERIGNORE
+# Prevents sensitive runtime files, DBs, and keys from container builds
+# ==========================================
+
+# Environment and Secrets
+.env
+.env.*
+*.env
+
+# Python Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# SQLite Database Files & WAL files
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.backup
+
+# Proof Uploads Directory
+uploads/
+
+# TLS / Cryptographic Keys and Certificates
+*.pem
+*.key
+*.cert
+*.crt
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*.class
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Git and IDE
+.git/
+.gitignore
+.dockerignore
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+debug_js.txt
+scratch_script_0.js
+
+# Distribution archives
+*.zip
+*.tar.gz
+
