@@ -1333,7 +1333,7 @@ def admin_login():
         app.logger.warning(f"Failed admin authentication attempt from {client_ip}")
         return jsonify({'success': False, 'message': 'Invalid admin passkey access denied!'}), 401
 
-    valid_keys = [ADMIN_PASSKEY, 'arenax2026', 'arenax@2026', 'arena2026', 'arenaxpass']
+    valid_keys = [ADMIN_PASSKEY, 'arenaxnipe.nitte.fiza']
     if any(secrets.compare_digest(passkey, k) for k in valid_keys if k):
         reset_rate_limit(client_ip, 'login')
         session.clear()
