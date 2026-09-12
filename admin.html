@@ -2206,7 +2206,8 @@ You can also use the 'Photo / Scan File' button to take a photo of the QR code w
 
             // 2. Check session storage for authenticated session
             if (sessionStorage.getItem('arena_admin_auth') === 'true') {
-                showDashboardView();
+                const wasStatic = sessionStorage.getItem('arena_admin_static') === 'true';
+                showDashboardView(wasStatic);
                 return;
             }
 
@@ -2219,7 +2220,8 @@ You can also use the 'Photo / Scan File' button to take a photo of the QR code w
             document.getElementById('admin-dashboard-screen').style.display = 'none';
         }
 
-        function showDashboardView() {
+        function showDashboardView(staticMode = false) {
+            isStaticMode = staticMode;
             document.getElementById('admin-login-screen').style.display = 'none';
             document.getElementById('admin-dashboard-screen').style.display = 'block';
 
@@ -2229,7 +2231,7 @@ You can also use the 'Photo / Scan File' button to take a photo of the QR code w
             if (typeof loadGameStatuses === 'function') loadGameStatuses();
             if (typeof loadAdminAnnouncements === 'function') loadAdminAnnouncements();
 
-            if (!staticMode) {
+            if (!isStaticMode) {
                 setInterval(() => {
                     if (typeof loadAdminMatches === 'function') loadAdminMatches();
                 }, 5000);
@@ -2256,6 +2258,15 @@ You can also use the 'Photo / Scan File' button to take a photo of the QR code w
             }
         }
 
+        async function computePassHash(str) {
+            try {
+                const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+                return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+            } catch(e) {
+                return '';
+            }
+        }
+
         async function handleLogin(e) {
             e.preventDefault();
             const passkeyInput = document.getElementById('passkey-input');
@@ -2269,29 +2280,48 @@ You can also use the 'Photo / Scan File' button to take a photo of the QR code w
             btn.disabled = true;
             err.style.display = 'none';
 
+            // 1. Try server backend authentication first
             try {
                 const res = await fetch('/api/admin/login', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ passkey })
                 });
-                const data = await res.json();
 
-                if (res.ok && data.success) {
-                    sessionStorage.setItem('arena_admin_auth', 'true');
-                    showDashboardView(false);
-                    return;
-                } else {
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.success) {
+                        sessionStorage.setItem('arena_admin_auth', 'true');
+                        sessionStorage.removeItem('arena_admin_static');
+                        showDashboardView(false);
+                        return;
+                    }
+                } else if (res.status === 401) {
+                    const data = await res.json().catch(() => ({}));
                     err.innerText = data.message || 'Access Denied: Incorrect Security Passkey';
                     err.style.display = 'block';
+                    btn.innerHTML = '<i class="fa-solid fa-shield-halved"></i> UNLOCK COMMAND CENTER';
+                    btn.disabled = false;
+                    return;
                 }
             } catch(errNet) {
-                err.innerText = 'Access Denied: Authentication server unreachable or invalid passkey.';
-                err.style.display = 'block';
-            } finally {
-                btn.innerHTML = '<i class="fa-solid fa-shield-halved"></i> UNLOCK COMMAND CENTER';
-                btn.disabled = false;
+                // Server backend is unreachable (e.g. static Cloudflare Pages hosting)
             }
+
+            // 2. Offline / Standalone Cloudflare mode: Verify cryptographic SHA-256 hash
+            // Protected hash of authorized organizer passkey
+            const hash = await computePassHash(passkey);
+            if (hash === '4c345a08f7c299af052fd7d0d8d429480888f204198f65f16e13199516d20b90') {
+                sessionStorage.setItem('arena_admin_auth', 'true');
+                sessionStorage.setItem('arena_admin_static', 'true');
+                showDashboardView(true);
+                return;
+            }
+
+            err.innerText = 'Access Denied: Incorrect Security Passkey';
+            err.style.display = 'block';
+            btn.innerHTML = '<i class="fa-solid fa-shield-halved"></i> UNLOCK COMMAND CENTER';
+            btn.disabled = false;
         }
 
         async function handleAdminLogout() {
@@ -2303,6 +2333,7 @@ You can also use the 'Photo / Scan File' button to take a photo of the QR code w
                 });
             } catch(e) {}
             sessionStorage.removeItem('arena_admin_auth');
+            sessionStorage.removeItem('arena_admin_static');
             sessionStorage.removeItem('arena_admin_pass');
             showLoginView();
         }
