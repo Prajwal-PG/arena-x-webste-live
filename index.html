@@ -1084,8 +1084,10 @@
             padding: 4px;
             box-shadow: 0 0 15px rgba(0, 243, 255, 0.15);
         }
+        .captcha-preview-wrap canvas,
         .captcha-preview-wrap img {
             height: 48px;
+            width: 170px;
             border-radius: 4px;
             display: block;
         }
@@ -5180,7 +5182,8 @@
                         <!-- Built-in Cyberpunk Visual CAPTCHA -->
                         <div class="captcha-chamber" id="builtin-captcha-chamber">
                             <div class="captcha-preview-wrap">
-                                <img id="captcha-img" src="" alt="Security CAPTCHA" title="Verification Code" />
+                                <canvas id="captcha-canvas" width="200" height="56" title="Click to refresh security code" onclick="refreshCaptcha()" style="cursor: pointer;"></canvas>
+                                <img id="captcha-img" src="" alt="" style="display: none;" />
                                 <button type="button" class="btn-captcha-refresh" onclick="refreshCaptcha()" title="Request new security code" aria-label="Refresh Security Code">
                                     <i class="fa-solid fa-arrows-rotate" id="captcha-refresh-icon"></i>
                                 </button>
@@ -5190,6 +5193,41 @@
                             </div>
                             <input type="hidden" id="captcha-token-input" name="captcha_token" value="">
                         </div>
+                        <script>
+                            (function() {
+                                try {
+                                    const canvas = document.getElementById('captcha-canvas');
+                                    if (canvas) {
+                                        const ctx = canvas.getContext('2d');
+                                        ctx.fillStyle = '#080c1e';
+                                        ctx.fillRect(0, 0, 200, 56);
+                                        ctx.strokeStyle = '#121c3c';
+                                        ctx.lineWidth = 1;
+                                        for (let x = 0; x < 200; x += 20) {
+                                            ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, 56); ctx.stroke();
+                                        }
+                                        for (let y = 0; y < 56; y += 14) {
+                                            ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(200, y); ctx.stroke();
+                                        }
+                                        const colors = ['#00f3ff', '#ff0055', '#00ff77', '#ffd700', '#a855f7'];
+                                        const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+                                        let code = '';
+                                        for (let i = 0; i < 5; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
+                                        ctx.font = 'bold 26px "Orbitron", monospace, sans-serif';
+                                        ctx.textBaseline = 'middle';
+                                        for (let i = 0; i < 5; i++) {
+                                            ctx.fillStyle = colors[i % colors.length];
+                                            ctx.shadowColor = colors[i % colors.length];
+                                            ctx.shadowBlur = 8;
+                                            ctx.fillText(code[i], 22 + i * 32, 28);
+                                        }
+                                        const b64 = btoa(code.split('').reverse().join(''));
+                                        const tok = document.getElementById('captcha-token-input');
+                                        if (tok) tok.value = 'CFB:' + Date.now() + ':' + b64;
+                                    }
+                                } catch(e) {}
+                            })();
+                        </script>
                     </div>
 
                     <button type="submit" class="btn-cyber" style="width: 100%; font-size: 1.1rem; padding: 18px;">
@@ -5688,7 +5726,7 @@
                     code += chars.charAt(Math.floor(Math.random() * chars.length));
                 }
 
-                const canvas = document.createElement('canvas');
+                const canvas = document.getElementById('captcha-canvas') || document.createElement('canvas');
                 canvas.width = 200;
                 canvas.height = 56;
                 const ctx = canvas.getContext('2d');
@@ -5765,10 +5803,7 @@
             const icon = document.getElementById('captcha-refresh-icon');
             if (icon) icon.classList.add('fa-spin');
             
-            const imgEl = document.getElementById('captcha-img');
-            if (imgEl && (!imgEl.src || imgEl.src.length < 50)) {
-                renderCyberpunkFallbackCaptcha();
-            }
+            renderCyberpunkFallbackCaptcha();
 
             try {
                 const res = await fetch('/api/captcha');
@@ -5778,7 +5813,18 @@
                 if (data && data.success) {
                     const tokenEl = document.getElementById('captcha-token-input');
                     const solInput = document.getElementById('captcha-solution-input');
+                    const canvas = document.getElementById('captcha-canvas');
+                    const imgEl = document.getElementById('captcha-img');
                     
+                    if (data.image && canvas) {
+                        const sImg = new Image();
+                        sImg.onload = () => {
+                            const ctx = canvas.getContext('2d');
+                            ctx.clearRect(0, 0, canvas.width, canvas.height);
+                            ctx.drawImage(sImg, 0, 0, canvas.width, canvas.height);
+                        };
+                        sImg.src = data.image;
+                    }
                     if (imgEl) imgEl.src = data.image;
                     if (tokenEl) tokenEl.value = data.token;
                     currentCaptchaToken = data.token;
@@ -5799,11 +5845,9 @@
                             }
                         }
                     }
-                } else {
-                    renderCyberpunkFallbackCaptcha();
                 }
             } catch(err) {
-                renderCyberpunkFallbackCaptcha();
+                // Keep the crisp canvas fallback already rendered
             } finally {
                 if (icon) icon.classList.remove('fa-spin');
             }
@@ -5814,10 +5858,15 @@
             loadCaptcha();
         }
 
-        window.addEventListener('DOMContentLoaded', () => {
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', () => {
+                renderCyberpunkFallbackCaptcha();
+                loadCaptcha();
+            });
+        } else {
             renderCyberpunkFallbackCaptcha();
             loadCaptcha();
-        });
+        }
 
         /* Submit Form to Python Backend */
         
