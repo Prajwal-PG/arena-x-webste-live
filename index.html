@@ -5223,7 +5223,7 @@
             <div class="footer-bottom">
                 <p>&copy; 2026 ARENA X Esports Tournament (Sept 18 - Oct 04, 2026). Passes on BookMyShow.</p>
                 <p style="margin-top: 8px;">
-                    <a href="/admin" style="color: #64748b; font-size: 0.82rem; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; transition: color 0.2s ease;">
+                    <a href="/admin.html" style="color: #64748b; font-size: 0.82rem; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; transition: color 0.2s ease;">
                         <i class="fa-solid fa-shield-halved"></i> Gate Marshal &amp; Organizer Portal
                     </a>
                 </p>
@@ -5680,16 +5680,102 @@
            ========================================== */
         let currentCaptchaToken = '';
 
+        function renderCyberpunkFallbackCaptcha() {
+            try {
+                const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+                let code = '';
+                for (let i = 0; i < 5; i++) {
+                    code += chars.charAt(Math.floor(Math.random() * chars.length));
+                }
+
+                const canvas = document.createElement('canvas');
+                canvas.width = 200;
+                canvas.height = 56;
+                const ctx = canvas.getContext('2d');
+
+                // Cyberpunk dark background
+                ctx.fillStyle = '#080c1e';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                // Grid pattern
+                ctx.strokeStyle = '#121c3c';
+                ctx.lineWidth = 1;
+                for (let x = 0; x < canvas.width; x += 20) {
+                    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+                }
+                for (let y = 0; y < canvas.height; y += 14) {
+                    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+                }
+
+                const colors = ['#00f3ff', '#ff0055', '#00ff77', '#ffd700', '#a855f7'];
+
+                // Interference lines
+                for (let i = 0; i < 4; i++) {
+                    ctx.strokeStyle = colors[Math.floor(Math.random() * colors.length)];
+                    ctx.lineWidth = 1.2;
+                    ctx.beginPath();
+                    ctx.moveTo(Math.random() * canvas.width, Math.random() * canvas.height);
+                    ctx.lineTo(Math.random() * canvas.width, Math.random() * canvas.height);
+                    ctx.stroke();
+                }
+
+                // Noise dots
+                for (let i = 0; i < 50; i++) {
+                    ctx.fillStyle = colors[Math.floor(Math.random() * colors.length)];
+                    ctx.fillRect(Math.random() * canvas.width, Math.random() * canvas.height, 2, 2);
+                }
+
+                // Characters with rotation and jitter
+                ctx.font = 'bold 26px "Orbitron", monospace, sans-serif';
+                ctx.textBaseline = 'middle';
+                let startX = 22;
+                for (let i = 0; i < code.length; i++) {
+                    const ch = code[i];
+                    ctx.save();
+                    const rot = (Math.random() - 0.5) * 0.4;
+                    const charY = 28 + (Math.random() - 0.5) * 8;
+                    ctx.translate(startX, charY);
+                    ctx.rotate(rot);
+                    const color = colors[Math.floor(Math.random() * colors.length)];
+                    ctx.fillStyle = color;
+                    ctx.shadowColor = color;
+                    ctx.shadowBlur = 10;
+                    ctx.fillText(ch, 0, 0);
+                    ctx.restore();
+                    startX += 32;
+                }
+
+                const dataUrl = canvas.toDataURL('image/png');
+                const imgEl = document.getElementById('captcha-img');
+                const tokenEl = document.getElementById('captcha-token-input');
+                const solInput = document.getElementById('captcha-solution-input');
+
+                if (imgEl) imgEl.src = dataUrl;
+                const b64 = btoa(code.split('').reverse().join(''));
+                const token = `CFB:${Date.now()}:${b64}`;
+                if (tokenEl) tokenEl.value = token;
+                currentCaptchaToken = token;
+                if (solInput) solInput.value = '';
+            } catch(e) {
+                console.error('Fallback CAPTCHA generation error:', e);
+            }
+        }
+
         async function loadCaptcha() {
             const icon = document.getElementById('captcha-refresh-icon');
             if (icon) icon.classList.add('fa-spin');
             
+            const imgEl = document.getElementById('captcha-img');
+            if (imgEl && (!imgEl.src || imgEl.src.length < 50)) {
+                renderCyberpunkFallbackCaptcha();
+            }
+
             try {
                 const res = await fetch('/api/captcha');
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const data = await res.json();
                 
-                if (data.success) {
-                    const imgEl = document.getElementById('captcha-img');
+                if (data && data.success) {
                     const tokenEl = document.getElementById('captcha-token-input');
                     const solInput = document.getElementById('captcha-solution-input');
                     
@@ -5713,9 +5799,11 @@
                             }
                         }
                     }
+                } else {
+                    renderCyberpunkFallbackCaptcha();
                 }
             } catch(err) {
-                console.error('Failed to load security CAPTCHA:', err);
+                renderCyberpunkFallbackCaptcha();
             } finally {
                 if (icon) icon.classList.remove('fa-spin');
             }
@@ -5726,7 +5814,10 @@
             loadCaptcha();
         }
 
-        window.addEventListener('DOMContentLoaded', loadCaptcha);
+        window.addEventListener('DOMContentLoaded', () => {
+            renderCyberpunkFallbackCaptcha();
+            loadCaptcha();
+        });
 
         /* Submit Form to Python Backend */
         

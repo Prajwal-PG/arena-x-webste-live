@@ -1,2017 +1,59 @@
-import os
-import sqlite3
-import uuid
-import time
-import secrets
-import smtplib
-import re
-import base64
-import threading
-import io
-import csv
-import html
-import hmac
-import hashlib
-import random
-from functools import wraps
-from datetime import datetime, timedelta
-from collections import defaultdict
-from PIL import Image, ImageDraw, ImageFont
-from flask import Flask, request, jsonify, send_from_directory, session, redirect, Response
-from flask_cors import CORS
-from werkzeug.utils import secure_filename, safe_join
-from werkzeug.middleware.proxy_fix import ProxyFix
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-
-# ==========================================
-# 0. PRODUCTION SECURITY & CONFIGURATION
-# ==========================================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Auto-load .env environment file immediately before reading any variables
-ENV_PATH = os.path.join(BASE_DIR, '.env')
-if os.path.exists(ENV_PATH):
-    try:
-        with open(ENV_PATH, 'r', encoding='utf-8') as env_f:
-            for line in env_f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    k, v = line.split('=', 1)
-                    os.environ[k.strip()] = v.strip().strip("'\"")
-    except Exception as env_err:
-        print(f"[SECURITY ALERT] Error reading .env file: {str(env_err)}")
-
-def require_env(name):
-    """
-    Retrieves mandatory environment variable or raises RuntimeError immediately on startup.
-    Prevents predictable fallback secrets from ever running in production.
-    """
-    value = os.environ.get(name, '').strip()
-    if not value:
-        raise RuntimeError(f"[SECURITY FATAL] Mandatory environment variable '{name}' must be configured.")
-    return value
-
-# Mandatory Cryptographic Secrets (No hardcoded fallbacks)
-SECRET_KEY = require_env('SECRET_KEY')
-ADMIN_PASSKEY = require_env('ARENA_ADMIN_KEY')
-DB_PASSWORD = require_env('DB_PASSWORD')
-
-# Database Security & Master Paths
-DATA_DIR = os.path.join(BASE_DIR, 'data')
-os.makedirs(DATA_DIR, exist_ok=True)
-DB_PATH = os.path.join(DATA_DIR, 'arena_x.db')
-
-# Protected Uploads Directory
-UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-# Secure Flask Application Instance
-app = Flask(__name__, static_folder=None)
-app.secret_key = SECRET_KEY
-
-# Configure ProxyFix if deployed behind a reverse proxy (e.g. Nginx, Render, AWS ALB)
-USE_PROXY = os.environ.get('BEHIND_PROXY', 'false').lower() in ('true', '1')
-if USE_PROXY:
-    try:
-        proxies_count = int(os.environ.get('PROXIES_COUNT', '1'))
-    except ValueError:
-        proxies_count = 1
-    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=proxies_count, x_proto=proxies_count, x_host=proxies_count, x_prefix=proxies_count)
-
-# Production Mode Enforcement
-IS_PRODUCTION = os.environ.get('FLASK_ENV', '').lower() == 'production'
-
-# Secure Session Configuration
-SESSION_COOKIE_SECURE = os.environ.get('SESSION_COOKIE_SECURE', 'false').lower() in ('true', '1')
-if IS_PRODUCTION:
-    if not SESSION_COOKIE_SECURE:
-        raise RuntimeError("[SECURITY FATAL] SESSION_COOKIE_SECURE must be set to 'true' in production (FLASK_ENV=production).")
-
-TRUST_CLOUDFLARE_IP = os.environ.get('TRUST_CLOUDFLARE_IP', 'true').lower() in ('true', '1')
-raw_trusted_proxies = os.environ.get('TRUSTED_PROXIES', '127.0.0.1,::1,localhost')
-TRUSTED_PROXIES = {p.strip() for p in raw_trusted_proxies.split(',') if p.strip()}
-
-def get_client_ip():
-    """
-    Extract client IP securely with anti-spoofing validation.
-    Only trusts CF-Connecting-IP / True-Client-IP when the upstream connection
-    originates from a trusted reverse proxy (e.g. local Nginx).
-    """
-    remote = (request.remote_addr or '127.0.0.1').strip()
-    if TRUST_CLOUDFLARE_IP and (remote in TRUSTED_PROXIES or not IS_PRODUCTION):
-        for header in ('CF-Connecting-IP', 'True-Client-IP'):
-            val = request.headers.get(header)
-            if val:
-                candidate = val.split(',')[0].strip()
-                # Basic sanity check for valid IP address syntax
-                if re.match(r'^[0-9a-fA-F:.]+$', candidate) and len(candidate) <= 45:
-                    return candidate
-    return remote
-
-app.config.update(
-    UPLOAD_FOLDER=UPLOAD_FOLDER,
-    MAX_CONTENT_LENGTH=3 * 1024 * 1024,  # 3 MB max overall request body
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SECURE=SESSION_COOKIE_SECURE,
-    SESSION_COOKIE_SAMESITE='Lax',
-    PERMANENT_SESSION_LIFETIME=timedelta(hours=2)
-)
-
-# Strict CORS Allowlist (No wildcard credentials)
-raw_origins = os.environ.get('ALLOWED_ORIGINS', 'http://127.0.0.1:5000,http://localhost:5000')
-ALLOWED_ORIGINS = [orig.strip() for orig in raw_origins.split(',') if orig.strip() and orig.strip() != '*']
-if not ALLOWED_ORIGINS:
-    ALLOWED_ORIGINS = ['http://127.0.0.1:5000', 'http://localhost:5000']
-
-# Also permit Cloudflare Pages deployment domains
-CLOUDFLARE_PAGES_PATTERN = re.compile(r"^https://[a-zA-Z0-9-]+\.pages\.dev$")
-CORS_ORIGINS = ALLOWED_ORIGINS + [CLOUDFLARE_PAGES_PATTERN]
-
-CORS(
-    app,
-    resources={r"/api/*": {"origins": CORS_ORIGINS}},
-    supports_credentials=True,
-    methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-CSRF-Token", "Authorization"]
-)
-
-# Payload Too Large (413) Handler
-@app.errorhandler(413)
-def handle_payload_too_large(error):
-    return jsonify({
-        'success': False,
-        'message': 'File size exceeds allowed limits (Max 300 KB for screenshot proofs). Please compress before uploading.'
-    }), 413
-
-# Bad Request (400) Handler
-@app.errorhandler(400)
-def handle_bad_request(error):
-    return jsonify({
-        'success': False,
-        'message': 'Bad request. The request payload is missing required fields or has invalid syntax.'
-    }), 400
-
-# Not Found (404) Handler
-@app.errorhandler(404)
-def handle_not_found(error):
-    if request.path.startswith('/api/'):
-        return jsonify({
-            'success': False,
-            'message': 'Resource not found.'
-        }), 404
-    return send_from_directory(BASE_DIR, 'index.html'), 404
-
-# Method Not Allowed (405) Handler
-@app.errorhandler(405)
-def handle_method_not_allowed(error):
-    return jsonify({
-        'success': False,
-        'message': 'HTTP method not allowed for this endpoint.'
-    }), 405
-
-# Internal Server Error (500) Handler
-@app.errorhandler(500)
-def handle_internal_error(error):
-    app.logger.exception(f"Unhandled internal server error on {request.path}")
-    return jsonify({
-        'success': False,
-        'message': 'An internal server error occurred. Please try again later.'
-    }), 500
-
-# ==========================================
-# 0.5 DATABASE CRYPTOGRAPHY & SECURITY ENGINE
-# ==========================================
-DEFAULT_KDF_SALT = b'ARENA_X_2026_SECURE_SALT_v1'
-raw_kdf_salt = os.environ.get('DB_KDF_SALT', '').strip()
-SALT = raw_kdf_salt.encode('utf-8') if raw_kdf_salt else DEFAULT_KDF_SALT
-
-def get_cipher():
-    """
-    Derives a 32-byte cryptographic key for Fernet authenticated encryption
-    (AES-128-CBC with PKCS7 padding and HMAC-SHA256 authentication)
-    from DB_PASSWORD via PBKDF2-HMAC-SHA256 (200,000 iterations).
-    """
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=SALT,
-        iterations=200000,
-    )
-    derived_key = base64.urlsafe_b64encode(kdf.derive(DB_PASSWORD.encode('utf-8')))
-    return Fernet(derived_key)
-
-cipher_suite = get_cipher()
-
-def encrypt_field(val):
-    """Encrypts sensitive participant PII before storing in SQLite database."""
-    if val is None:
-        return None
-    val_str = str(val).strip()
-    if not val_str or val_str.startswith('ENC:'):
-        return val_str
-    try:
-        token = cipher_suite.encrypt(val_str.encode('utf-8')).decode('utf-8')
-        return f"ENC:{token}"
-    except Exception as err:
-        app.logger.error(f"Field encryption failure: {err}")
-        return val_str
-
-def decrypt_field(val):
-    """Decrypts sensitive participant PII using DB_PASSWORD derived key."""
-    if val is None:
-        return None
-    val_str = str(val).strip()
-    if not val_str.startswith('ENC:'):
-        return val_str
-    token = val_str[4:]
-    try:
-        return cipher_suite.decrypt(token.encode('utf-8')).decode('utf-8')
-    except Exception as err:
-        app.logger.error(f"Field decryption failure: {err}")
-        return "[PROTECTED_DATA_LOCKED]"
-
-def get_db_connection():
-    """Establishes a hardened SQLite connection with WAL mode, foreign keys, and secure deletion."""
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
-    cursor = conn.cursor()
-    cursor.execute('PRAGMA foreign_keys = ON')
-    cursor.execute('PRAGMA journal_mode = WAL')
-    cursor.execute('PRAGMA synchronous = NORMAL')
-    cursor.execute('PRAGMA secure_delete = ON')
-    cursor.execute('PRAGMA busy_timeout = 5000')
-    cursor.close()
-    return conn
-
-# Security Headers Middleware
-@app.after_request
-def apply_security_headers(response):
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-Frame-Options'] = 'SAMEORIGIN'
-    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
-    response.headers['Permissions-Policy'] = 'camera=(self), microphone=(), geolocation=()'
-    
-    # HSTS enabled when request was served over HTTPS or behind Cloudflare Edge SSL
-    is_https = (
-        request.is_secure or
-        request.headers.get('X-Forwarded-Proto', '').lower() == 'https' or
-        '"scheme":"https"' in request.headers.get('CF-Visitor', '')
-    )
-    if is_https:
-        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains; preload'
-
-    # Cloudflare & Browser Edge Caching Directives
-    if request.path.startswith('/api/') or request.path.startswith('/admin') or request.path.startswith('/uploads'):
-        response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0, private'
-        response.headers['Pragma'] = 'no-cache'
-        response.headers['Expires'] = '0'
-    elif any(request.path.lower().endswith(ext) for ext in ('.png', '.jpg', '.jpeg', '.svg', '.ico', '.webp', '.woff', '.woff2', '.ttf')):
-        response.headers['Cache-Control'] = 'public, max-age=86400, stale-while-revalidate=43200'
-
-    response.headers['Content-Security-Policy'] = (
-        "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://unpkg.com https://challenges.cloudflare.com; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com; "
-        "font-src 'self' https://fonts.gstatic.com https://cdnjs.cloudflare.com; "
-        "img-src 'self' data: blob:; "
-        "media-src 'self' blob: data:; "
-        "connect-src 'self' https://cloudflareinsights.com; "
-        "frame-src 'self' https://www.google.com https://maps.google.com https://challenges.cloudflare.com; "
-        "frame-ancestors 'self'; "
-        "base-uri 'self';"
-    )
-    return response
-
-# ==========================================
-# 0.6 RATE LIMITING & ABUSE PREVENTION ENGINE
-# ==========================================
-REDIS_URL = os.environ.get('REDIS_URL', '').strip() or 'redis://127.0.0.1:6379/0'
-redis_client = None
-
-try:
-    import redis
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=1)
-    redis_client.ping()
-    app.logger.info("Connected to Redis shared rate-limiter storage successfully.")
-except Exception as redis_err:
-    if os.environ.get('REDIS_URL'):
-        app.logger.warning(f"Configured REDIS_URL unreachable ({redis_err}). Operating with resilient in-memory sliding-window rate limiter.")
-    redis_client = None
-
-rate_limit_lock = threading.Lock()
-in_memory_rate_tracker = defaultdict(list)
-# Backward-compatible references
-register_attempts = in_memory_rate_tracker
-login_attempts = in_memory_rate_tracker
-MAX_SCREENSHOT_BYTES = 300 * 1024
-
-def reset_rate_limit(ip, bucket_name):
-    """Resets the rate-limit counter for an IP upon successful authentication."""
-    key = f"rate_limit:{bucket_name}:{ip}"
-    if redis_client:
-        try:
-            redis_client.delete(key)
-        except Exception:
-            pass
-    with rate_limit_lock:
-        in_memory_rate_tracker.pop(key, None)
-
-def is_rate_limited(ip, bucket_name, limit=5, window_seconds=60):
-    """
-    Dual-engine rate limiter supporting Redis in multi-worker production
-    and thread-safe in-memory sliding-window fallback for local development.
-    """
-    key = f"rate_limit:{bucket_name}:{ip}"
-    if redis_client:
-        try:
-            current_count = redis_client.incr(key)
-            if current_count == 1:
-                redis_client.expire(key, window_seconds)
-            if current_count > limit:
-                app.logger.warning(f"Rate limit exceeded for {ip} on bucket '{bucket_name}' (Redis)")
-                return True
-            return False
-        except Exception as r_err:
-            app.logger.error(f"Redis rate-limit check failed ({r_err}), using in-memory fallback.")
-
-    now = time.time()
-    with rate_limit_lock:
-        timestamps = in_memory_rate_tracker[key]
-        valid_timestamps = [t for t in timestamps if now - t < window_seconds]
-        if len(in_memory_rate_tracker) > 2000:
-            for k in list(in_memory_rate_tracker.keys()):
-                in_memory_rate_tracker[k] = [t for t in in_memory_rate_tracker[k] if now - t < window_seconds]
-                if not in_memory_rate_tracker[k]:
-                    del in_memory_rate_tracker[k]
-        if len(valid_timestamps) >= limit:
-            in_memory_rate_tracker[key] = valid_timestamps
-            app.logger.warning(f"Rate limit exceeded for {ip} on bucket '{bucket_name}' (Memory)")
-            return True
-        valid_timestamps.append(now)
-        in_memory_rate_tracker[key] = valid_timestamps
-        return False
-
-# ==========================================
-# 0.7 CSRF PROTECTION & ADMIN AUTH DECORATOR
-# ==========================================
-def validate_csrf():
-    """Validates CSRF token on state-changing requests for authenticated sessions."""
-    expected_token = session.get('csrf_token')
-    if not expected_token:
-        if session.get('is_admin'):
-            session['csrf_token'] = secrets.token_hex(32)
-            expected_token = session['csrf_token']
-        else:
-            return False
-    provided_token = request.headers.get('X-CSRF-Token')
-    if not provided_token and request.is_json:
-        data = request.get_json(silent=True) or {}
-        provided_token = data.get('csrf_token')
-    if not provided_token and request.form:
-        provided_token = request.form.get('csrf_token')
-    if not provided_token:
-        return False
-    return secrets.compare_digest(str(provided_token), str(expected_token))
-
-def admin_required(f):
-    """
-    Reusable admin authentication decorator:
-    1. Verifies authenticated admin session.
-    2. Enforces session lifetime expiration.
-    3. Enforces CSRF token validation on state-changing methods (POST, PUT, DELETE, PATCH).
-    """
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if not session.get('is_admin'):
-            app.logger.warning(f"Unauthorized admin access attempt to {request.path} from {get_client_ip()}")
-            return jsonify({'success': False, 'message': 'Unauthorized: Admin authentication required.'}), 401
-
-        now = time.time()
-        login_time = session.get('login_time')
-        last_activity = session.get('last_activity', login_time or now)
-        lifetime_sec = app.config['PERMANENT_SESSION_LIFETIME'].total_seconds()
-        idle_limit_sec = 30 * 60  # 30-minute idle inactivity timeout
-
-        if (now - last_activity > idle_limit_sec) or (login_time and (now - login_time > lifetime_sec)):
-            app.logger.info(f"Admin session timed out (idle/lifetime) for {get_client_ip()}")
-            session.clear()
-            return jsonify({'success': False, 'message': 'Session expired due to inactivity. Please log in again.'}), 401
-
-        session['last_activity'] = now
-
-        if request.method in ('POST', 'PUT', 'DELETE', 'PATCH'):
-            if not validate_csrf():
-                app.logger.warning(f"CSRF validation failed on {request.path} from {get_client_ip()}")
-                return jsonify({'success': False, 'message': 'Security token missing or invalid. Please refresh and try again.'}), 403
-
-        return f(*args, **kwargs)
-    return decorated_function
-
-# ==========================================
-# 0.8 FILE UPLOAD & PROOF HARDENING ENGINE
-# ==========================================
-Image.MAX_IMAGE_PIXELS = 20_000_000  # Mitigates decompression bomb exploits
-MAX_SCREENSHOT_BYTES = 300 * 1024  # 300 KB limit (307,200 bytes)
-ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
-
-def validate_uploaded_image(file_storage):
-    """
-    Deep inspects file byte size, magic binary headers, and PIL structure.
-    Strictly restricts uploads to PNG and JPG formats only, with a hard cap of 300 KB.
-    """
-    try:
-        # 1. Verify byte size does not exceed 300 KB
-        file_storage.seek(0, os.SEEK_END)
-        file_size = file_storage.tell()
-        file_storage.seek(0)
-
-        if file_size == 0:
-            return False, "Uploaded file is empty. Please select a valid screenshot image."
-
-        if file_size > MAX_SCREENSHOT_BYTES:
-            size_kb = round(file_size / 1024, 1)
-            return False, f"File size exceeds 300 KB limit (your file: {size_kb} KB). Please compress before uploading."
-
-        # 2. Binary Magic Header Inspection
-        header = file_storage.read(16)
-        file_storage.seek(0)
-
-        is_png = header.startswith(b'\x89PNG\r\n\x1a\n')
-        is_jpeg = header.startswith(b'\xff\xd8\xff')
-
-        if not (is_png or is_jpeg):
-            return False, "Unsupported file format. Only PNG and JPG/JPEG image files are permitted."
-
-        # 3. PIL Image Structure & Dimension Inspection
-        with Image.open(file_storage) as img:
-            img_format = (img.format or '').upper()
-            if img_format not in {'PNG', 'JPEG'}:
-                return False, f"Invalid image format ('{img_format}'). Only PNG and JPG files are accepted."
-
-            if img.width > 8000 or img.height > 8000:
-                return False, "Image dimensions exceed maximum allowed limits (8000x8000)."
-
-            detected_ext = 'png' if img_format == 'PNG' else 'jpg'
-
-        file_storage.seek(0)
-        return True, detected_ext
-
-    except Exception as e:
-        app.logger.warning(f"File validation failed: {str(e)}")
-        file_storage.seek(0)
-        return False, "File validation failed: Not a valid or supported image file."
-
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-def sanitize_and_save_image(file_storage, target_path, target_ext):
-    """
-    Decodes uploaded image using Pillow, strips all EXIF/metadata,
-    and re-encodes into a clean, safe PNG or JPEG file to neutralize polyglot
-    payloads, embedded scripts, and malicious metadata.
-    """
-    try:
-        file_storage.seek(0)
-        with Image.open(file_storage) as img:
-            clean_format = 'PNG' if target_ext.lower() == 'png' else 'JPEG'
-            if clean_format == 'JPEG':
-                if img.mode in ('RGBA', 'LA', 'P'):
-                    clean_img = Image.new('RGB', img.size, (255, 255, 255))
-                    clean_img.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
-                else:
-                    clean_img = img.convert('RGB')
-                clean_img.save(target_path, format='JPEG', quality=85, optimize=True)
-            else:
-                if img.mode not in ('RGB', 'RGBA', 'L'):
-                    clean_img = img.convert('RGBA')
-                else:
-                    clean_img = img.copy()
-                clean_img.save(target_path, format='PNG', optimize=True)
-        file_storage.seek(0)
-        return True
-    except Exception as save_err:
-        app.logger.warning(f"Image sanitization failed, falling back to direct save: {save_err}")
-        file_storage.seek(0)
-        file_storage.save(target_path)
-        file_storage.seek(0)
-        return True
-
-# Validation Regex & Whitelists
-EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
-PHONE_REGEX = re.compile(r'^\+?[0-9\s\-()]{7,20}$')
-ALLOWED_STATUSES = {'VERIFIED', 'REJECTED', 'PENDING_VERIFICATION'}
-ALLOWED_CATEGORIES = {'IMPORTANT', 'SCHEDULE', 'RULES', 'STAGE CALL', 'TICKETS', 'GENERAL'}
-
-# ==========================================
-# 0.9 LOCAL QR CODE & SMTP EMAIL ENGINE
-# ==========================================
-def generate_qr_bytes(token):
-    """Generates pure QR code bytes locally using qrcode[pil] without external APIs."""
-    try:
-        import qrcode
-        qr = qrcode.QRCode(
-            version=1,
-            error_correction=qrcode.constants.ERROR_CORRECT_H,
-            box_size=8,
-            border=2,
-        )
-        qr.add_data(token)
-        qr.make(fit=True)
-        img = qr.make_image(fill_color="black", back_color="white")
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return buf.getvalue()
-    except Exception as qr_err:
-        app.logger.error(f"Local QR generation failed: {qr_err}")
-        return None
-
-# ==========================================
-# 0.10 CYBERSECURITY CAPTCHA ENGINE
-# ==========================================
-TURNSTILE_SITE_KEY = os.environ.get('TURNSTILE_SITE_KEY', '').strip()
-TURNSTILE_SECRET_KEY = os.environ.get('TURNSTILE_SECRET_KEY', '').strip()
-
-def render_captcha_image(solution):
-    """Generates a high-contrast Cyberpunk verification badge image with distortion."""
-    width, height = 200, 56
-    img = Image.new('RGB', (width, height), color=(8, 12, 30))
-    draw = ImageDraw.Draw(img)
-
-    # Cyberpunk grid lines
-    for x in range(0, width, 20):
-        draw.line([(x, 0), (x, height)], fill=(18, 28, 60), width=1)
-    for y in range(0, height, 14):
-        draw.line([(0, y), (width, y)], fill=(18, 28, 60), width=1)
-
-    neon_colors = [(0, 243, 255), (255, 0, 85), (0, 255, 119), (255, 215, 0), (168, 85, 247)]
-    
-    # Interference neon lines
-    for _ in range(4):
-        c = random.choice(neon_colors)
-        p1 = (random.randint(0, width), random.randint(0, height))
-        p2 = (random.randint(0, width), random.randint(0, height))
-        draw.line([p1, p2], fill=(c[0] // 2, c[1] // 2, c[2] // 2), width=1)
-
-    # Noise dots
-    for _ in range(50):
-        c = random.choice(neon_colors)
-        draw.point((random.randint(0, width - 1), random.randint(0, height - 1)), fill=c)
-
-    # Characters with rotation and jitter
-    try:
-        font = ImageFont.load_default(size=26)
-    except Exception:
-        font = ImageFont.load_default()
-
-    char_x = 22
-    for ch in solution:
-        char_img = Image.new('RGBA', (36, 42), (0, 0, 0, 0))
-        char_draw = ImageDraw.Draw(char_img)
-        color = random.choice(neon_colors)
-        char_draw.text((6, 4), ch, fill=(*color, 255), font=font)
-        
-        rot = random.randint(-18, 18)
-        rotated = char_img.rotate(rot, expand=1, resample=Image.BICUBIC)
-        char_y = random.randint(5, 11)
-        img.paste(rotated, (char_x, char_y), rotated)
-        char_x += 32
-
-    buf = io.BytesIO()
-    img.save(buf, format='PNG')
-    return 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
-
-def generate_captcha():
-    """
-    Generates a cryptographic cyberpunk CAPTCHA challenge containing ONLY
-    uppercase letters (A-Z) and numbers (2-9), signed with HMAC.
-    Avoids ambiguous glyphs (0/O, 1/I) for maximum legibility.
-    """
-    uppercase_chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
-    digit_chars = '23456789'
-    all_chars = uppercase_chars + digit_chars
-
-    # Guarantee at least 1 letter and 1 number in 5-character challenge
-    code_chars = [
-        random.choice(uppercase_chars),
-        random.choice(digit_chars),
-        random.choice(all_chars),
-        random.choice(all_chars),
-        random.choice(all_chars)
-    ]
-    random.shuffle(code_chars)
-    solution = ''.join(code_chars)
-
-    timestamp = int(time.time())
-    salt = secrets.token_hex(8)
-    
-    payload = f"{solution}:{timestamp}:{salt}"
-    sig = hmac.new(SECRET_KEY.encode('utf-8'), payload.encode('utf-8'), hashlib.sha256).hexdigest()
-    token = f"{timestamp}:{salt}:{sig}"
-    data_url = render_captcha_image(solution)
-    return token, data_url
-
-def verify_captcha(solution, token):
-    """
-    Verifies CAPTCHA token with expiration and HMAC integrity.
-    Automatically normalizes user input to uppercase for seamless typing.
-    Also supports authenticated client fallback tokens (CFB:) for static hosting resilience.
-    """
-    if not solution or not token:
-        return False, "CAPTCHA verification code is required."
-
-    # Resilient support for client fallback tokens (e.g. static Cloudflare preview)
-    if token.startswith('CFB:'):
-        try:
-            parts = token.split(':')
-            if len(parts) >= 3:
-                ts = int(parts[1])
-                # 10 minute expiration window
-                if time.time() - (ts / 1000.0) > 600:
-                    return False, "CAPTCHA code expired. Please refresh and try again."
-                expected_sol = base64.b64decode(parts[2].encode('utf-8')).decode('utf-8')[::-1]
-                if solution.strip().upper() == expected_sol.strip().upper():
-                    return True, "CAPTCHA verified successfully."
-                return False, "Incorrect CAPTCHA verification code. Please try again."
-        except Exception:
-            return False, "Invalid CAPTCHA security token."
-
-    parts = token.split(':')
-    if len(parts) < 3:
-        return False, "Malformed CAPTCHA security token."
-    try:
-        ts = int(parts[0])
-        salt = parts[1]
-        provided_sig = parts[2]
-    except ValueError:
-        return False, "Invalid CAPTCHA timestamp format."
-
-    if time.time() - ts > 300:
-        return False, "CAPTCHA code expired (5 min limit). Please refresh."
-    if ts > time.time() + 60:
-        return False, "Invalid future timestamp on CAPTCHA token."
-
-    expected_payload = f"{solution.strip().upper()}:{ts}:{salt}"
-    expected_sig = hmac.new(SECRET_KEY.encode('utf-8'), expected_payload.encode('utf-8'), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected_sig, provided_sig):
-        return False, "Incorrect CAPTCHA verification code. Please try again."
-    return True, "CAPTCHA verified successfully."
-
-def verify_turnstile(token, ip):
-    """Optionally verifies Cloudflare Turnstile token if configured."""
-    if not TURNSTILE_SECRET_KEY:
-        return True, "Turnstile not configured"
-    try:
-        import urllib.request, urllib.parse, json
-        data = urllib.parse.urlencode({
-            'secret': TURNSTILE_SECRET_KEY,
-            'response': token,
-            'remoteip': ip
-        }).encode('utf-8')
-        req = urllib.request.Request('https://challenges.cloudflare.com/turnstile/v0/siteverify', data=data)
-        with urllib.request.urlopen(req, timeout=5) as res:
-            outcome = json.loads(res.read().decode('utf-8'))
-            if outcome.get('success'):
-                return True, "Turnstile verified"
-            return False, "Cloudflare Turnstile verification failed."
-    except Exception as e:
-        app.logger.warning(f"Turnstile verification error: {e}")
-        return False, "Cloudflare Turnstile verification error."
-
-def get_smtp_config():
-    """Retrieve active SMTP credentials dynamically from environment."""
-    server = os.environ.get('SMTP_SERVER', 'smtp.gmail.com').strip()
-    try:
-        port = int(os.environ.get('SMTP_PORT', 587))
-    except ValueError:
-        port = 587
-    username = os.environ.get('SMTP_USERNAME', '').strip()
-    password = os.environ.get('SMTP_PASSWORD', '').strip()
-    sender = os.environ.get('SENDER_EMAIL', username).strip()
-    return server, port, username, password, sender
-
-def send_qr_email(recipient_email, captain_name, team_name, selected_game, formatted_id, qr_token, district_booking_id, is_approval=False):
-    """Generates and dispatches Accreditation Pass email with locally generated QR code."""
-    from email.mime.text import MIMEText
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.image import MIMEImage
-
-    if not recipient_email:
-        return False, "Recipient email address is missing."
-
-    server_host, server_port, username, password, sender_email = get_smtp_config()
-
-    # Generate QR Code bytes LOCALLY (No third-party network APIs)
-    qr_bytes = generate_qr_bytes(qr_token)
-
-    # Safely HTML-escape all user-controlled values to prevent HTML injection in email templates
-    esc_captain = html.escape(str(captain_name))
-    esc_team = html.escape(str(team_name))
-    esc_game = html.escape(str(selected_game))
-    esc_formatted_id = html.escape(str(formatted_id))
-    esc_qr_token = html.escape(str(qr_token))
-    esc_booking_id = html.escape(str(district_booking_id))
-
-    status_badge_text = "Verified & Approved" if is_approval else "Accreditation Confirmed"
-    status_badge_color = "#059669" if is_approval else "#0284c7"
-    headline_text = "Your registration and BookMyShow payment proof have been officially verified & approved by ARENA X tournament organizers!" if is_approval else "Your registration has been successfully recorded. Your official accreditation pass and entry QR code are detailed below."
-
-    plain_text = f"""Hello {captain_name},
-
-Thank you for registering for ARENA X 2026 at Fiza by Nexus Mall, Mangaluru.
-{headline_text}
-
---- TOURNAMENT DETAILS ---
-Registration ID: #{formatted_id}
-Tournament Discipline: {selected_game}
-Team / Athlete Handle: {team_name}
-Captain / Athlete Name: {captain_name}
-BookMyShow Booking ID: {district_booking_id}
-Venue: Main Stage Arena, Fiza by Nexus Mall, Mangaluru
-Event Dates: Sept 18 - Oct 04, 2026
-
---- ON-SITE GATE ACCREDITATION PASS TOKEN ---
-QR Code Token: {qr_token}
-
-Please present this QR code or pass token at the venue entrance for gate accreditation check-in.
-Looking forward to seeing you at ARENA X 2026!
-
-Best regards,
-ARENA X 2026 Organizing Committee
-Fiza by Nexus Mall, Mangaluru
-"""
-
-    img_src = "cid:qr_pass_cid" if qr_bytes else ""
-
-    html_content = f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ARENA X 2026 Entry Pass</title>
-    <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f1f5f9; color: #1e293b; margin: 0; padding: 24px; }}
-        .card {{ max-width: 580px; margin: 0 auto; background: #ffffff; border-radius: 12px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.07); }}
-        .card-header {{ background: #0b0f19; padding: 28px 24px; text-align: center; border-bottom: 3px solid #00f3ff; }}
-        .title {{ color: #ffffff; font-size: 24px; font-weight: 800; letter-spacing: 2px; margin: 0; }}
-        .subtitle {{ color: #94a3b8; font-size: 13px; margin-top: 6px; }}
-        .badge {{ display: inline-block; background: {status_badge_color}; color: #ffffff; padding: 5px 14px; border-radius: 20px; font-size: 12px; font-weight: 700; margin-top: 14px; }}
-        .card-body {{ padding: 28px 24px; }}
-        .greeting {{ font-size: 15px; line-height: 1.6; color: #334155; margin-bottom: 20px; }}
-        .details-table {{ width: 100%; border-collapse: collapse; margin: 18px 0; background: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0; }}
-        .details-table td {{ padding: 12px 16px; border-bottom: 1px solid #e2e8f0; font-size: 14px; }}
-        .details-table tr:last-child td {{ border-bottom: none; }}
-        .label {{ color: #64748b; font-size: 12px; font-weight: 600; text-transform: uppercase; width: 40%; }}
-        .value {{ color: #0f172a; font-weight: 700; }}
-        .qr-container {{ text-align: center; padding: 24px; background: #f8fafc; border-radius: 8px; border: 1px dashed #cbd5e1; margin: 24px 0; }}
-        .qr-title {{ font-size: 13px; font-weight: 700; color: #0f172a; margin-bottom: 12px; }}
-        .qr-box {{ display: inline-block; padding: 10px; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 8px; }}
-        .qr-img {{ width: 170px; height: 170px; display: block; }}
-        .token-code {{ font-family: Consolas, monospace; font-size: 13px; color: #0284c7; font-weight: 700; margin-top: 10px; letter-spacing: 1.5px; }}
-        .card-footer {{ padding: 20px; text-align: center; font-size: 12px; color: #64748b; border-top: 1px solid #e2e8f0; background: #fafafa; }}
-    </style>
-</head>
-<body>
-    <div class="card">
-        <div class="card-header">
-            <h1 class="title">ARENA X 2026</h1>
-            <div class="subtitle">Mangaluru Premier Esports Championship | Fiza by Nexus Mall</div>
-            <div class="badge">{status_badge_text}</div>
-        </div>
-        <div class="card-body">
-            <div class="greeting">
-                Hello <strong>{esc_captain}</strong>,<br>
-                {headline_text}
-            </div>
-            <table class="details-table">
-                <tr><td class="label">Pass ID</td><td class="value" style="color: #0284c7;">#{esc_formatted_id}</td></tr>
-                <tr><td class="label">Tournament</td><td class="value">{esc_game}</td></tr>
-                <tr><td class="label">Team / Athlete</td><td class="value">{esc_team}</td></tr>
-                <tr><td class="label">Captain</td><td class="value">{esc_captain}</td></tr>
-                <tr><td class="label">BookMyShow Booking ID</td><td class="value" style="color: #e11d48;">{esc_booking_id}</td></tr>
-                <tr><td class="label">Venue</td><td class="value">Main Stage Arena, Fiza by Nexus Mall, Mangaluru</td></tr>
-                <tr><td class="label">Event Dates</td><td class="value">Sept 18 - Oct 04, 2026</td></tr>
-            </table>
-            <div class="qr-container">
-                <div class="qr-title">On-Site Gate Accreditation QR Pass</div>
-                <div class="qr-box">
-                    {"<img src=\"" + img_src + "\" alt=\"Accreditation QR Pass\" class=\"qr-img\">" if img_src else ""}
-                </div>
-                <div class="token-code">{esc_qr_token}</div>
-                <p style="font-size: 12px; color: #64748b; margin-top: 8px; margin-bottom: 0;">Present this QR code on your mobile device at the venue entrance for gate accreditation check-in.</p>
-            </div>
-        </div>
-        <div class="card-footer">
-            ARENA X 2026 | Fiza by Nexus Mall, Mangaluru<br>
-            For any questions or support, reply directly to this email or visit our help desk.
-        </div>
-    </div>
-</body>
-</html>
-"""
-
-    if not username or not password:
-        app.logger.info(f"SMTP credentials not configured. Email dispatch skipped for {recipient_email}")
-        return False, "SMTP credentials missing in environment."
-
-    try:
-        import email.utils
-        msg_root = MIMEMultipart('related')
-        pass_type = "Verified Entry Pass" if is_approval else "Entry Pass"
-        msg_root['Subject'] = f"Your ARENA X 2026 {pass_type} - {team_name} ({formatted_id})"
-        msg_root['From'] = f"ARENA X 2026 <{sender_email}>"
-        msg_root['To'] = recipient_email
-        msg_root['Reply-To'] = os.environ.get('REPLY_TO_EMAIL', sender_email).strip()
-        msg_root['Date'] = email.utils.formatdate(localtime=True)
-        msg_root['Message-ID'] = email.utils.make_msgid(domain='gmail.com')
-
-        msg_alt = MIMEMultipart('alternative')
-        msg_alt.attach(MIMEText(plain_text, 'plain', 'utf-8'))
-        msg_alt.attach(MIMEText(html_content, 'html', 'utf-8'))
-        msg_root.attach(msg_alt)
-
-        if qr_bytes:
-            img_part = MIMEImage(qr_bytes)
-            img_part.add_header('Content-ID', '<qr_pass_cid>')
-            img_part.add_header('Content-Disposition', 'inline', filename='arena_x_qr_pass.png')
-            msg_root.attach(img_part)
-
-        with smtplib.SMTP(server_host, server_port, timeout=12) as server:
-            server.starttls()
-            server.login(username, password)
-            server.sendmail(sender_email, [recipient_email], msg_root.as_string())
-        app.logger.info(f"Accreditation QR email sent successfully to {recipient_email}")
-        return True, "Accreditation QR pass emailed successfully."
-    except Exception as err:
-        app.logger.error(f"Failed to send email to {recipient_email}: {err}")
-        return False, "SMTP Transmission Failure."
-
-# ==========================================
-# 1. DATABASE SCHEMA INITIALIZATION
-# ==========================================
-def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS registrations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            selected_game TEXT NOT NULL,
-            team_name TEXT NOT NULL,
-            captain_name TEXT NOT NULL,
-            captain_whatsapp TEXT NOT NULL,
-            emergency_contact TEXT NOT NULL,
-            captain_email TEXT NOT NULL,
-            gamer_uid TEXT NOT NULL,
-            player2_name TEXT,
-            player3_name TEXT,
-            player4_name TEXT,
-            player5_name TEXT,
-            district_booking_id TEXT NOT NULL,
-            screenshot_filename TEXT NOT NULL,
-            screenshot_filepath TEXT NOT NULL,
-            status TEXT DEFAULT 'PENDING_VERIFICATION',
-            qr_token TEXT UNIQUE,
-            checkin_status TEXT DEFAULT 'NOT_CHECKED_IN',
-            checkin_time TIMESTAMP,
-            checked_in_by TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-
-    new_cols = [
-        ('qr_token', 'TEXT'),
-        ('checkin_status', "TEXT DEFAULT 'NOT_CHECKED_IN'"),
-        ('checkin_time', 'TIMESTAMP'),
-        ('checked_in_by', 'TEXT')
-    ]
-    for col_name, col_type in new_cols:
-        try:
-            cursor.execute(f"ALTER TABLE registrations ADD COLUMN {col_name} {col_type}")
-        except Exception:
-            pass
-
-    cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_registrations_qr_token ON registrations(qr_token)')
-
-    cursor.execute("SELECT id FROM registrations WHERE qr_token IS NULL OR qr_token = ''")
-    rows = cursor.fetchall()
-    for row in rows:
-        token = f"AX2026_{secrets.token_urlsafe(32)}"
-        cursor.execute("UPDATE registrations SET qr_token = ? WHERE id = ?", (token, row[0]))
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS matches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            game_title TEXT NOT NULL,
-            stage_name TEXT NOT NULL,
-            round_number INTEGER DEFAULT 1,
-            team1_name TEXT NOT NULL,
-            team2_name TEXT NOT NULL,
-            team1_score INTEGER DEFAULT 0,
-            team2_score INTEGER DEFAULT 0,
-            status TEXT DEFAULT 'UPCOMING',
-            winner_team TEXT DEFAULT '',
-            match_time TEXT DEFAULT '',
-            stream_url TEXT DEFAULT '',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-
-    cursor.execute('SELECT COUNT(*) FROM matches')
-    if cursor.fetchone()[0] == 0:
-        sample_matches = [
-            ('Valorant 5v5', 'Quarter-Finals', 1, 'Velocity Esports', 'Apex Strikers', 2, 1, 'COMPLETED', 'Velocity Esports', '14:00 IST', ''),
-            ('Valorant 5v5', 'Quarter-Finals', 2, 'Sentinels X', 'Fnatic India', 0, 2, 'COMPLETED', 'Fnatic India', '15:30 IST', ''),
-            ('Valorant 5v5', 'Quarter-Finals', 3, 'Paper Rex Squad', 'DRX Gladiators', 2, 1, 'COMPLETED', 'Paper Rex Squad', '17:00 IST', ''),
-            ('Valorant 5v5', 'Quarter-Finals', 4, 'Team Liquid IN', 'Natus Vincere', 2, 0, 'COMPLETED', 'Team Liquid IN', '18:15 IST', ''),
-            ('Valorant 5v5', 'Semi-Finals', 1, 'Velocity Esports', 'Fnatic India', 1, 1, 'LIVE', '', 'LIVE NOW', ''),
-            ('Valorant 5v5', 'Semi-Finals', 2, 'Paper Rex Squad', 'Team Liquid IN', 0, 0, 'UPCOMING', '', '20:30 IST', ''),
-            ('Valorant 5v5', 'Grand Finale', 1, 'TBD (SF1 Winner)', 'TBD (SF2 Winner)', 0, 0, 'UPCOMING', '', 'Sept 27, 18:00', ''),
-            ('FIFA 1v1', 'Quarter-Finals', 1, 'CyberStriker99', 'NeonKicker', 3, 1, 'COMPLETED', 'CyberStriker99', '11:00 IST', ''),
-            ('FIFA 1v1', 'Quarter-Finals', 2, 'PixelKing', 'GoalMachine', 2, 4, 'COMPLETED', 'GoalMachine', '11:45 IST', ''),
-            ('FIFA 1v1', 'Semi-Finals', 1, 'CyberStriker99', 'GoalMachine', 2, 3, 'LIVE', '', 'LIVE NOW', ''),
-            ('FIFA 1v1', 'Grand Finale', 1, 'TBD (SF1 Winner)', 'TBD (SF2 Winner)', 0, 0, 'UPCOMING', '', 'Oct 03, 16:00', ''),
-            ('BGMI', 'Group Stage', 1, 'GodLike Esports', 'Team Soul', 45, 38, 'COMPLETED', 'GodLike Esports', 'Match 1 Fin.', ''),
-            ('BGMI', 'Group Stage', 2, 'Team XSpark', 'Global Esports', 42, 30, 'LIVE', '', 'Match 2 LIVE', ''),
-            ('BGMI', 'Group Stage', 3, 'Reckoning Esports', 'Blind Esports', 28, 25, 'UPCOMING', '', 'Oct 03, 19:00', ''),
-            ('CODM', 'Semi-Finals', 1, 'Alpha Warriors', 'Shadow Ops', 3, 2, 'COMPLETED', 'Alpha Warriors', '16:00 IST', ''),
-            ('CODM', 'Semi-Finals', 2, 'Ghost Squad', 'Vanguard Elite', 1, 3, 'COMPLETED', 'Vanguard Elite', '17:30 IST', ''),
-            ('CODM', 'Grand Finale', 1, 'Alpha Warriors', 'Vanguard Elite', 1, 2, 'LIVE', '', 'LIVE NOW', ''),
-            ('FreeFire Max', 'Group Stage', 1, 'Total Gaming', 'Orangutan Esports', 50, 42, 'COMPLETED', 'Total Gaming', 'Sept 26, 14:00', ''),
-            ('FreeFire Max', 'Group Stage', 2, 'Chemin Esports', 'Nigma Galaxy', 35, 30, 'LIVE', '', 'Match 2 LIVE', ''),
-            ('Clash Royale', 'Arena Knockouts', 1, 'KingSlayer_CR', 'RoyaleMaster', 2, 1, 'UPCOMING', '', 'Sept 22, 16:30', ''),
-            ('Clash Royale', 'Grand Finals', 1, 'TBD', 'TBD', 0, 0, 'UPCOMING', '', 'Sept 23, 17:00', '')
-        ]
-        cursor.executemany('''
-            INSERT INTO matches (game_title, stage_name, round_number, team1_name, team2_name, team1_score, team2_score, status, winner_team, match_time, stream_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', sample_matches)
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS game_status (
-            game_title TEXT PRIMARY KEY,
-            is_open INTEGER DEFAULT 1,
-            category TEXT DEFAULT '',
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-
-    all_19_games = [
-        ('Valorant 1v1', 'PC'), ('Valorant 2v2', 'PC'), ('Valorant 5v5', 'PC'),
-        ('Brawlhalla 1v1', 'PC'), ('Brawlhalla 2v2', 'PC'),
-        ('FIFA 1v1', 'Console'), ('FIFA 2v2', 'Console'), ('UFC 1v1', 'Console'),
-        ('Gear Club 1v1', 'Console'), ('Mortal Kombat 1v1', 'Console'),
-        ('Rocket League 2v2', 'Console'), ('WWE 2v2', 'Console'), ('COD 2v2', 'Console'),
-        ('FreeFire Max', 'Mobile'), ('BGMI', 'Mobile'), ('CODM', 'Mobile'),
-        ('Clash Royale', 'Mobile'), ('Clash of Clans', 'Mobile'), ('E-Football', 'Mobile')
-    ]
-    for g_title, g_cat in all_19_games:
-        cursor.execute('''
-            INSERT OR IGNORE INTO game_status (game_title, is_open, category)
-            VALUES (?, 1, ?)
-        ''', (g_title, g_cat))
-
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS announcements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            category TEXT DEFAULT 'GENERAL',
-            message TEXT NOT NULL,
-            is_pinned INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-
-    cursor.execute('SELECT COUNT(*) FROM announcements')
-    if cursor.fetchone()[0] == 0:
-        sample_announcements = [
-            (
-                "Gate Accreditation & Pass Screenshot Mandatory",
-                "IMPORTANT",
-                "All registered athletes and attendees must save or take a screenshot of their Accreditation Pass QR code. The QR code will be scanned at the Fiza by Nexus entrance gate for on-site accreditation check-in.",
-                1
-            ),
-            (
-                "Official Passes Live on BookMyShow",
-                "TICKETS",
-                "Official tournament entry passes are live exclusively via BookMyShow. Keep your BookMyShow Booking ID ready when registering for your tournament games.",
-                1
-            ),
-            (
-                "High-Speed LAN Arena Stage Infrastructure Ready",
-                "STAGE CALL",
-                "GAMEBOT pro-grade gigabit LAN network deployment is finalized on the Main Stage at Fiza by Nexus Mall for zero-latency, lag-free competitive championship matches.",
-                0
-            )
-        ]
-        cursor.executemany('''
-            INSERT INTO announcements (title, category, message, is_pinned)
-            VALUES (?, ?, ?, ?)
-        ''', sample_announcements)
-
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# ==========================================
-# 2. HARDENED STATIC FILE ROUTING
-# ==========================================
-ALLOWED_STATIC_EXTENSIONS = {
-    'html', 'css', 'js', 'png', 'jpg', 'jpeg', 'webp', 'svg', 'ico',
-    'woff', 'woff2', 'ttf', 'eot', 'mp4', 'webm', 'ogg', 'mp3', 'wav', 'json'
-}
-
-BLOCKED_EXACT_FILES = {
-    '.env', 'app.py', '.gitignore', 'arena_x.db', 'debug_js.txt', 'scratch_script_0.js', 'README.md', 'wsgi.py', 'Procfile'
-}
-
-@app.route('/')
-def serve_index():
-    response = send_from_directory(BASE_DIR, 'index.html')
-    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, max-age=0'
-    response.headers['Pragma'] = 'no-cache'
-    response.headers['Expires'] = '0'
-    return response
-
-@app.route('/<path:filename>')
-def serve_static(filename):
-    """Strictly whitelisted static file server preventing any directory traversal or database/env disclosure."""
-    normalized = filename.replace('\\', '/').strip('/')
-    base = os.path.basename(normalized)
-
-    if (
-        base.startswith('.')
-        or base in BLOCKED_EXACT_FILES
-        or normalized.startswith('data/')
-        or normalized.startswith('uploads/')
-        or normalized.startswith('__pycache__')
-        or normalized.startswith('tests/')
-        or any(normalized.endswith(ext) for ext in ('.py', '.db', '.sqlite', '.sqlite3', '.env', '.backup', '.bak', '.log', '.sh', '.bat'))
-    ):
-        return jsonify({'error': 'Forbidden: Access denied to protected resource.'}), 403
-
-    if normalized.startswith('api/'):
-        return jsonify({'success': False, 'message': 'Resource not found.'}), 404
-
-    ext = normalized.rsplit('.', 1)[-1].lower() if '.' in normalized else ''
-    if ext not in ALLOWED_STATIC_EXTENSIONS:
-        return jsonify({'success': False, 'message': 'Resource not found.'}), 404
-
-    safe_path = safe_join(BASE_DIR, normalized)
-    if not safe_path or not os.path.isfile(safe_path):
-        return jsonify({'success': False, 'message': 'Resource not found.'}), 404
-
-    return send_from_directory(BASE_DIR, normalized)
-
-@app.route('/uploads/<path:filename>')
-@admin_required
-def serve_upload(filename):
-    """Restricted upload server: Only authenticated admins can inspect uploaded screenshots."""
-    clean_name = os.path.basename(filename)
-    safe_path = safe_join(app.config['UPLOAD_FOLDER'], clean_name)
-    if not safe_path or not os.path.isfile(safe_path):
-        return jsonify({'success': False, 'message': 'File not found.'}), 404
-    return send_from_directory(app.config['UPLOAD_FOLDER'], clean_name)
-
-# ==========================================
-# 3. GAME STATUS & REGISTRATION API ENDPOINTS
-# ==========================================
-@app.route('/api/game-status', methods=['GET'])
-def get_game_status():
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT game_title, is_open, category FROM game_status ORDER BY category, game_title")
-        rows = cursor.fetchall()
-        conn.close()
-        statuses = {row[0]: bool(row[1]) for row in rows}
-        details = [{'title': row[0], 'is_open': bool(row[1]), 'category': row[2]} for row in rows]
-        return jsonify({'success': True, 'games': statuses, 'details': details})
-    except Exception:
-        app.logger.exception("Error retrieving game status")
-        return jsonify({'success': False, 'message': 'Failed to retrieve game status.'}), 500
-
-@app.route('/api/admin/toggle-game-registration', methods=['POST'])
-@admin_required
-def toggle_game_registration():
-    try:
-        data = request.get_json(silent=True) or request.form or {}
-        game_title = data.get('game_title', '').strip()
-        is_open = data.get('is_open')
-
-        if not game_title:
-            return jsonify({'success': False, 'message': 'Missing game_title parameter'}), 400
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        if is_open is None:
-            cursor.execute("SELECT is_open FROM game_status WHERE game_title = ?", (game_title,))
-            curr = cursor.fetchone()
-            new_val = 0 if curr and curr[0] == 1 else 1
-        else:
-            new_val = 1 if (is_open is True or str(is_open) in ['1', 'true', 'True']) else 0
-
-        cursor.execute("""
-            INSERT INTO game_status (game_title, is_open, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(game_title) DO UPDATE SET is_open = ?, updated_at = CURRENT_TIMESTAMP
-        """, (game_title, new_val, new_val))
-        conn.commit()
-        conn.close()
-
-        status_str = "OPEN" if new_val == 1 else "CLOSED"
-        app.logger.info(f"Admin updated registration for '{game_title}' to {status_str}")
-        return jsonify({
-            'success': True,
-            'game_title': game_title,
-            'is_open': bool(new_val),
-            'message': f"Registration for '{game_title}' is now {status_str}."
-        })
-    except Exception:
-        app.logger.exception("Error toggling game registration")
-        return jsonify({'success': False, 'message': 'Failed to toggle game registration status.'}), 500
-
-@app.route('/api/captcha', methods=['GET'])
-def get_captcha():
-    """Generates and serves a fresh visual Cyberpunk CAPTCHA challenge."""
-    client_ip = get_client_ip()
-    if is_rate_limited(client_ip, 'captcha', limit=60, window_seconds=60):
-        return jsonify({'success': False, 'message': 'Too many CAPTCHA requests. Please slow down.'}), 429
-        
-    token, data_url = generate_captcha()
-    return jsonify({
-        'success': True,
-        'image': data_url,
-        'token': token,
-        'turnstile_site_key': TURNSTILE_SITE_KEY or None
-    })
-
-@app.route('/api/register', methods=['POST'])
-def register_participant():
-    try:
-        client_ip = get_client_ip()
-        if is_rate_limited(client_ip, 'register', limit=5, window_seconds=600):
-            return jsonify({
-                'success': False,
-                'message': 'Rate limit exceeded! Please wait a few minutes before submitting another registration.'
-            }), 429
-
-        # 0. Anti-Bot CAPTCHA Verification
-        cf_turnstile_token = request.form.get('cf-turnstile-response', '').strip()
-        captcha_solution = request.form.get('captcha_solution', '').strip()
-        captcha_token = request.form.get('captcha_token', '').strip()
-
-        if TURNSTILE_SECRET_KEY and cf_turnstile_token:
-            valid_cap, cap_msg = verify_turnstile(cf_turnstile_token, client_ip)
-            if not valid_cap:
-                return jsonify({'success': False, 'message': f'SECURITY CAPTCHA FAILED: {cap_msg}'}), 400
-        else:
-            valid_cap, cap_msg = verify_captcha(captcha_solution, captcha_token)
-            if not valid_cap:
-                return jsonify({'success': False, 'message': f'SECURITY CAPTCHA FAILED: {cap_msg}'}), 400
-
-        file = request.files.get('bms_screenshot') or request.files.get('district_screenshot')
-        if not file:
-            return jsonify({
-                'success': False,
-                'message': 'Mandatory BookMyShow screenshot proof is missing! Please attach your booking screenshot.'
-            }), 400
-
-        if file.filename == '':
-            return jsonify({
-                'success': False,
-                'message': 'No file selected. Please upload a valid screenshot from BookMyShow.'
-            }), 400
-
-        # Deep Image Header, Byte-Size (300 KB max), and Magic Bytes Validation
-        is_valid_file, detected_ext = validate_uploaded_image(file)
-        if not is_valid_file:
-            return jsonify({
-                'success': False,
-                'message': detected_ext
-            }), 400
-
-        # Retrieve Form Data
-        selected_game = request.form.get('selected_game', '').strip()
-        team_name = request.form.get('team_name', '').strip()
-        captain_name = request.form.get('captain_name', '').strip()
-        captain_whatsapp = request.form.get('captain_whatsapp', '').strip()
-        emergency_contact = request.form.get('emergency_contact', '').strip()
-        captain_email = request.form.get('captain_email', '').strip().lower()
-        gamer_uid = request.form.get('gamer_uid', '').strip()
-        bms_booking_id = (request.form.get('bms_booking_id') or request.form.get('district_booking_id') or '').strip().upper()
-        district_booking_id = bms_booking_id
-
-        player2_name = request.form.get('player2_name', '').strip()
-        player3_name = request.form.get('player3_name', '').strip()
-        player4_name = request.form.get('player4_name', '').strip()
-        player5_name = request.form.get('player5_name', '').strip()
-
-        if not selected_game or not team_name or not captain_name or not captain_whatsapp or not captain_email or not district_booking_id:
-            return jsonify({
-                'success': False,
-                'message': 'Please fill out all mandatory contact and team details!'
-            }), 400
-
-        if not EMAIL_REGEX.match(captain_email):
-            return jsonify({
-                'success': False,
-                'message': 'Invalid email address format! Please enter a valid email.'
-            }), 400
-
-        if not PHONE_REGEX.match(captain_whatsapp):
-            return jsonify({
-                'success': False,
-                'message': 'Invalid WhatsApp number format! Please enter 7-20 digits.'
-            }), 400
-
-        conn_check = get_db_connection()
-        cur_check = conn_check.cursor()
-        cur_check.execute("SELECT is_open FROM game_status WHERE game_title = ?", (selected_game,))
-        status_row = cur_check.fetchone()
-        conn_check.close()
-        if status_row and status_row[0] == 0:
-            return jsonify({
-                'success': False,
-                'message': f'Registration for "{selected_game}" is currently CLOSED by tournament organizers.'
-            }), 400
-
-        if len(team_name) > 100 or len(captain_name) > 100 or len(captain_email) > 100 or len(district_booking_id) > 100 or len(gamer_uid) > 100:
-            return jsonify({
-                'success': False,
-                'message': 'Input length limit exceeded! Maximum allowed length per field is 100 characters.'
-            }), 400
-
-        # Save Screenshot File securely with randomized token name and metadata stripping
-        safe_ext = detected_ext
-        unique_filename = f"bms_{secrets.token_hex(16)}.{safe_ext}"
-        safe_filename = secure_filename(unique_filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], safe_filename)
-        sanitize_and_save_image(file, filepath, safe_ext)
-
-        # Generate unique cryptographic pass QR token (256-bit entropy CSPRNG)
-        qr_token = f"AX2026_{secrets.token_urlsafe(32)}"
-
-        # Encrypt sensitive PII fields at rest using AES-256
-        enc_whatsapp = encrypt_field(captain_whatsapp)
-        enc_emergency = encrypt_field(emergency_contact)
-        enc_email = encrypt_field(captain_email)
-        enc_uid = encrypt_field(gamer_uid)
-        enc_district = encrypt_field(district_booking_id)
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO registrations (
-                selected_game, team_name, captain_name, captain_whatsapp,
-                emergency_contact, captain_email, gamer_uid, player2_name,
-                player3_name, player4_name, player5_name, district_booking_id,
-                screenshot_filename, screenshot_filepath, status, qr_token, checkin_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            selected_game, team_name, captain_name, enc_whatsapp,
-            enc_emergency, enc_email, enc_uid, player2_name,
-            player3_name, player4_name, player5_name, enc_district,
-            safe_filename, f"/uploads/{safe_filename}", 'PENDING_VERIFICATION',
-            qr_token, 'NOT_CHECKED_IN'
-        ))
-
-        reg_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-
-        formatted_id = f"AX-2026-{reg_id:04d}"
-        app.logger.info(f"New registration #{formatted_id} recorded for team '{team_name}' ({selected_game})")
-
-        # Dispatch Pass Email asynchronously in background worker
-        threading.Thread(
-            target=send_qr_email,
-            args=(
-                captain_email, captain_name, team_name, selected_game,
-                formatted_id, qr_token, district_booking_id
-            ),
-            daemon=True
-        ).start()
-
-        # Public confirmation response: minimal data without PII or server upload paths
-        return jsonify({
-            'success': True,
-            'message': f'Registration submitted successfully! Registration ID: #{formatted_id}. Confirmation pass emailed to captain.',
-            'registration_id': formatted_id,
-            'qr_token': qr_token,
-            'selected_game': selected_game,
-            'team_name': team_name,
-            'captain_name': captain_name,
-            'gamer_uid': gamer_uid,
-            'district_booking_id': district_booking_id,
-            'bms_booking_id': district_booking_id,
-            'email_sent': True,
-            'timestamp': datetime.now().strftime("%d %b %Y, %I:%M %p")
-        }), 201
-
-    except Exception:
-        app.logger.exception("Error during participant registration")
-        return jsonify({
-            'success': False,
-            'message': 'An internal server error occurred while processing registration. Please try again.'
-        }), 500
-
-# ==========================================
-# 4. ADMIN AUTHENTICATION API
-# ==========================================
-@app.route('/api/admin/login', methods=['POST'])
-def admin_login():
-    client_ip = get_client_ip()
-    if is_rate_limited(client_ip, 'login', limit=5, window_seconds=60):
-        app.logger.warning(f"Admin login rate limit triggered for {client_ip}")
-        return jsonify({'success': False, 'message': 'Too many failed login attempts! Please wait 1 minute before trying again.'}), 429
-
-    data = request.get_json(silent=True) or {}
-    passkey = str(data.get('passkey', '')).strip()
-
-    if not passkey or len(passkey) > 200:
-        app.logger.warning(f"Failed admin authentication attempt from {client_ip}")
-        return jsonify({'success': False, 'message': 'Invalid admin passkey access denied!'}), 401
-
-    if secrets.compare_digest(passkey, ADMIN_PASSKEY):
-        reset_rate_limit(client_ip, 'login')
-        session.clear()
-        session['is_admin'] = True
-        session['login_time'] = time.time()
-        session['last_activity'] = time.time()
-        session['csrf_token'] = secrets.token_hex(32)
-        session.permanent = True
-        app.logger.info(f"Successful admin authentication from {client_ip}")
-        return jsonify({
-            'success': True,
-            'message': 'Authenticated successfully!',
-            'csrf_token': session['csrf_token']
-        })
-
-    app.logger.warning(f"Failed admin authentication attempt from {client_ip}")
-    return jsonify({'success': False, 'message': 'Invalid admin passkey access denied!'}), 401
-
-@app.route('/api/admin/logout', methods=['POST'])
-@admin_required
-def admin_logout():
-    client_ip = get_client_ip()
-    app.logger.info(f"Admin logged out from {client_ip}")
-    session.clear()
-    return jsonify({'success': True, 'message': 'Logged out successfully.'})
-
-@app.route('/api/admin/csrf-token', methods=['GET'])
-@admin_required
-def get_csrf_token():
-    if 'csrf_token' not in session:
-        session['csrf_token'] = secrets.token_hex(32)
-    return jsonify({'success': True, 'csrf_token': session['csrf_token']})
-
-# ==========================================
-# 5. ATHLETE REGISTRATIONS & VERIFICATION API
-# ==========================================
-@app.route('/api/registrations', methods=['GET'])
-@admin_required
-def get_registrations():
-    try:
-        conn = get_db_connection()
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM registrations ORDER BY id DESC')
-        rows = cursor.fetchall()
-        conn.close()
-
-        results = []
-        for r in rows:
-            row_dict = dict(r)
-            row_dict['captain_whatsapp'] = decrypt_field(row_dict.get('captain_whatsapp'))
-            row_dict['emergency_contact'] = decrypt_field(row_dict.get('emergency_contact'))
-            row_dict['captain_email'] = decrypt_field(row_dict.get('captain_email'))
-            row_dict['gamer_uid'] = decrypt_field(row_dict.get('gamer_uid'))
-            bms_id = decrypt_field(row_dict.get('district_booking_id'))
-            row_dict['district_booking_id'] = bms_id
-            row_dict['bms_booking_id'] = bms_id
-            results.append(row_dict)
-
-        return jsonify({'success': True, 'count': len(results), 'registrations': results})
-    except Exception:
-        app.logger.exception("Error fetching registrations")
-        return jsonify({'success': False, 'message': 'Failed to retrieve registrations.'}), 500
-
-@app.route('/api/registrations/<int:reg_id>/status', methods=['POST'])
-@admin_required
-def update_status(reg_id):
-    try:
-        data = request.get_json(silent=True) or {}
-        new_status = str(data.get('status', 'VERIFIED')).strip().upper()
-
-        if new_status not in ALLOWED_STATUSES:
-            return jsonify({'success': False, 'message': f'Invalid status. Allowed: {", ".join(sorted(ALLOWED_STATUSES))}'}), 400
-
-        conn = get_db_connection()
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute('UPDATE registrations SET status = ? WHERE id = ?', (new_status, reg_id))
-        conn.commit()
-
-        if new_status == 'VERIFIED':
-            cursor.execute('SELECT * FROM registrations WHERE id = ?', (reg_id,))
-            row = cursor.fetchone()
-            if row:
-                reg = dict(row)
-                cap_email = decrypt_field(reg.get('captain_email'))
-                dist_id = decrypt_field(reg.get('district_booking_id'))
-                fmt_id = f"AX-2026-{reg_id:04d}"
-                threading.Thread(
-                    target=send_qr_email,
-                    args=(
-                        cap_email, reg['captain_name'], reg['team_name'],
-                        reg['selected_game'], fmt_id, reg.get('qr_token', ''),
-                        dist_id
-                    ),
-                    kwargs={'is_approval': True},
-                    daemon=True
-                ).start()
-
-        conn.close()
-        app.logger.info(f"Admin updated registration #{reg_id} status to {new_status}")
-        return jsonify({'success': True, 'message': f'Registration #{reg_id} updated to {new_status}'})
-    except Exception:
-        app.logger.exception(f"Error updating registration #{reg_id}")
-        return jsonify({'success': False, 'message': 'Failed to update registration status.'}), 500
-
-@app.route('/api/admin/export-csv', methods=['GET'])
-@admin_required
-def export_registrations_csv():
-    """Generates and downloads a clean, decrypted RFC-4180 CSV with UTF-8 BOM for Excel."""
-    try:
-        target_date = request.args.get('date', 'all').strip().lower()
-        now_dt = datetime.now()
-        now_date = now_dt.strftime('%Y-%m-%d')
-        yesterday_date = (now_dt - timedelta(days=1)).strftime('%Y-%m-%d')
-
-        filter_date_str = None
-        if target_date in {'today', now_date}:
-            filter_date_str = now_date
-            file_suffix = f"Today_{now_date}"
-        elif target_date in {'yesterday', yesterday_date}:
-            filter_date_str = yesterday_date
-            file_suffix = f"Yesterday_{yesterday_date}"
-        elif re.match(r'^\d{4}-\d{2}-\d{2}$', target_date):
-            filter_date_str = target_date
-            file_suffix = target_date
-        else:
-            file_suffix = f"All_Time_{now_date}"
-
-        conn = get_db_connection()
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-
-        if filter_date_str:
-            cursor.execute("SELECT * FROM registrations WHERE created_at LIKE ? ORDER BY id DESC", (f"{filter_date_str}%",))
-        else:
-            cursor.execute("SELECT * FROM registrations ORDER BY id DESC")
-        rows = cursor.fetchall()
-        conn.close()
-
-        output = io.StringIO()
-        output.write('\ufeff')  # UTF-8 BOM for Excel
-        writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
-
-        writer.writerow([
-            "Registration ID", "Date & Time", "Tournament Discipline", "Team / Athlete",
-            "Captain Name", "WhatsApp Contact", "Emergency Contact", "Email Address",
-            "Gamer UID", "BookMyShow Booking ID", "Payment Status",
-            "Gate Check-In Status", "Gate Check-In Time", "Admitted By Marshal",
-            "QR Pass Token", "Roster Player 2", "Roster Player 3", "Roster Player 4",
-            "Roster Player 5", "Screenshot Filename"
-        ])
-
-        def sanitize_csv_cell(val):
-            if val is None:
-                return ''
-            s = str(val)
-            if s.startswith(('=', '+', '-', '@', '\t', '\r')):
-                return "'" + s
-            return s
-
-        for r in rows:
-            reg = dict(r)
-            fmt_id = f"AX-2026-{reg['id']:04d}"
-            writer.writerow([
-                sanitize_csv_cell(fmt_id),
-                sanitize_csv_cell(reg.get('created_at', '') or ''),
-                sanitize_csv_cell(reg.get('selected_game', '') or ''),
-                sanitize_csv_cell(reg.get('team_name', '') or ''),
-                sanitize_csv_cell(reg.get('captain_name', '') or ''),
-                sanitize_csv_cell(decrypt_field(reg.get('captain_whatsapp'))),
-                sanitize_csv_cell(decrypt_field(reg.get('emergency_contact'))),
-                sanitize_csv_cell(decrypt_field(reg.get('captain_email'))),
-                sanitize_csv_cell(decrypt_field(reg.get('gamer_uid'))),
-                sanitize_csv_cell(decrypt_field(reg.get('district_booking_id'))),
-                sanitize_csv_cell(reg.get('status', 'PENDING_VERIFICATION') or 'PENDING_VERIFICATION'),
-                sanitize_csv_cell(reg.get('checkin_status', 'NOT_CHECKED_IN') or 'NOT_CHECKED_IN'),
-                sanitize_csv_cell(reg.get('checkin_time', '') or ''),
-                sanitize_csv_cell(reg.get('checked_in_by', '') or ''),
-                sanitize_csv_cell(reg.get('qr_token', '') or ''),
-                sanitize_csv_cell(reg.get('player2_name', '') or ''),
-                sanitize_csv_cell(reg.get('player3_name', '') or ''),
-                sanitize_csv_cell(reg.get('player4_name', '') or ''),
-                sanitize_csv_cell(reg.get('player5_name', '') or ''),
-                sanitize_csv_cell(reg.get('screenshot_filename', '') or '')
-            ])
-
-        csv_data = output.getvalue()
-        filename = f"ArenaX_Registrations_{file_suffix}.csv"
-        app.logger.info(f"Admin exported registrations CSV ({file_suffix})")
-        return Response(
-            csv_data,
-            mimetype='text/csv; charset=utf-8',
-            headers={
-                'Content-Disposition': f'attachment; filename="{filename}"',
-                'Cache-Control': 'no-cache, no-store, must-revalidate'
-            }
-        )
-    except Exception:
-        app.logger.exception("Error generating registrations CSV")
-        return jsonify({'success': False, 'message': 'Failed to export CSV.'}), 500
-
-# ==========================================
-# 6. LIVE MATCHES & BRACKET MANAGEMENT API
-# ==========================================
-@app.route('/api/matches', methods=['GET'])
-def get_matches():
-    try:
-        game = request.args.get('game', '').strip()
-        conn = get_db_connection()
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        if game and game.lower() != 'all':
-            cursor.execute('SELECT * FROM matches WHERE LOWER(game_title) LIKE LOWER(?) ORDER BY id ASC', (f"%{game}%",))
-        else:
-            cursor.execute('SELECT * FROM matches ORDER BY id ASC')
-        rows = cursor.fetchall()
-        conn.close()
-
-        results = [dict(r) for r in rows]
-        return jsonify({'success': True, 'count': len(results), 'matches': results})
-    except Exception:
-        app.logger.exception("Error retrieving matches")
-        return jsonify({'success': False, 'message': 'Failed to retrieve tournament matches.'}), 500
-
-@app.route('/api/admin/matches', methods=['POST'])
-@admin_required
-def create_match():
-    try:
-        data = request.get_json(silent=True) or {}
-        game_title = str(data.get('game_title', '')).strip()
-        stage_name = str(data.get('stage_name', 'Quarter-Finals')).strip()
-        try:
-            round_number = int(data.get('round_number', 1))
-            team1_score = max(0, int(data.get('team1_score', 0)))
-            team2_score = max(0, int(data.get('team2_score', 0)))
-        except (ValueError, TypeError):
-            return jsonify({'success': False, 'message': 'Scores and round numbers must be valid integers.'}), 400
-
-        team1_name = str(data.get('team1_name', '')).strip()
-        team2_name = str(data.get('team2_name', '')).strip()
-        status = str(data.get('status', 'UPCOMING')).strip().upper()
-        winner_team = str(data.get('winner_team', '')).strip()
-        match_time = str(data.get('match_time', '')).strip()
-        stream_url = ''
-
-        if not game_title or not team1_name or not team2_name:
-            return jsonify({'success': False, 'message': 'Game title, Team 1, and Team 2 are required.'}), 400
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO matches (game_title, stage_name, round_number, team1_name, team2_name, team1_score, team2_score, status, winner_team, match_time, stream_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (game_title, stage_name, round_number, team1_name, team2_name, team1_score, team2_score, status, winner_team, match_time, stream_url))
-        conn.commit()
-        conn.close()
-        app.logger.info(f"Admin created match: {team1_name} vs {team2_name} ({game_title})")
-        return jsonify({'success': True, 'message': 'Match created successfully!'})
-    except Exception:
-        app.logger.exception("Error creating match")
-        return jsonify({'success': False, 'message': 'Failed to create match.'}), 500
-
-@app.route('/api/admin/matches/<int:match_id>/update', methods=['POST'])
-@admin_required
-def update_match(match_id):
-    try:
-        data = request.get_json(silent=True) or {}
-        try:
-            team1_score = max(0, int(data.get('team1_score', 0)))
-            team2_score = max(0, int(data.get('team2_score', 0)))
-        except (ValueError, TypeError):
-            return jsonify({'success': False, 'message': 'Scores must be valid integers.'}), 400
-
-        status = str(data.get('status', 'UPCOMING')).strip().upper()
-        winner_team = str(data.get('winner_team', '')).strip()
-        match_time = str(data.get('match_time', '')).strip()
-        stream_url = ''
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE matches 
-            SET team1_score = ?, team2_score = ?, status = ?, winner_team = ?, match_time = ?, stream_url = ?
-            WHERE id = ?
-        ''', (team1_score, team2_score, status, winner_team, match_time, stream_url, match_id))
-        conn.commit()
-        conn.close()
-        app.logger.info(f"Admin updated match #{match_id}")
-        return jsonify({'success': True, 'message': f'Match #{match_id} updated successfully!'})
-    except Exception:
-        app.logger.exception(f"Error updating match #{match_id}")
-        return jsonify({'success': False, 'message': 'Failed to update match.'}), 500
-
-@app.route('/api/admin/matches/<int:match_id>/delete', methods=['POST'])
-@admin_required
-def delete_match(match_id):
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('DELETE FROM matches WHERE id = ?', (match_id,))
-        conn.commit()
-        conn.close()
-        app.logger.info(f"Admin deleted match #{match_id}")
-        return jsonify({'success': True, 'message': f'Match #{match_id} deleted.'})
-    except Exception:
-        app.logger.exception(f"Error deleting match #{match_id}")
-        return jsonify({'success': False, 'message': 'Failed to delete match.'}), 500
-
-# ==========================================
-# 7. OFFICIAL TOURNAMENT ANNOUNCEMENTS API
-# ==========================================
-@app.route('/api/announcements', methods=['GET'])
-def get_announcements():
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT id, title, category, message, is_pinned, created_at
-            FROM announcements
-            ORDER BY is_pinned DESC, id DESC
-        ''')
-        rows = cursor.fetchall()
-        conn.close()
-        bulletins = [{
-            'id': row[0],
-            'title': row[1],
-            'category': row[2],
-            'message': row[3],
-            'is_pinned': bool(row[4]),
-            'created_at': row[5]
-        } for row in rows]
-        return jsonify({'success': True, 'announcements': bulletins})
-    except Exception:
-        app.logger.exception("Error fetching announcements")
-        return jsonify({'success': False, 'message': 'Failed to retrieve announcements.'}), 500
-
-@app.route('/api/admin/announcements/create', methods=['POST'])
-@admin_required
-def create_announcement():
-    try:
-        data = request.get_json(silent=True) or request.form or {}
-        title = str(data.get('title', '')).strip()
-        category = str(data.get('category', 'GENERAL')).strip().upper()
-        message = str(data.get('message', '')).strip()
-        is_pinned = 1 if (data.get('is_pinned') in [1, '1', True, 'true']) else 0
-
-        if not title or not message:
-            return jsonify({'success': False, 'message': 'Title and Message are required!'}), 400
-
-        if category not in ALLOWED_CATEGORIES:
-            category = 'GENERAL'
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO announcements (title, category, message, is_pinned)
-            VALUES (?, ?, ?, ?)
-        ''', (title, category, message, is_pinned))
-        new_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        app.logger.info(f"Admin published announcement #{new_id}: '{title}'")
-        return jsonify({
-            'success': True,
-            'message': 'Announcement published successfully!',
-            'id': new_id
-        })
-    except Exception:
-        app.logger.exception("Error creating announcement")
-        return jsonify({'success': False, 'message': 'Failed to create announcement.'}), 500
-
-@app.route('/api/admin/announcements/<int:announcement_id>/delete', methods=['POST'])
-@admin_required
-def delete_announcement(announcement_id):
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('DELETE FROM announcements WHERE id = ?', (announcement_id,))
-        conn.commit()
-        conn.close()
-        app.logger.info(f"Admin deleted announcement #{announcement_id}")
-        return jsonify({'success': True, 'message': 'Announcement deleted successfully!'})
-    except Exception:
-        app.logger.exception(f"Error deleting announcement #{announcement_id}")
-        return jsonify({'success': False, 'message': 'Failed to delete announcement.'}), 500
-
-@app.route('/api/admin/announcements/<int:announcement_id>/toggle-pin', methods=['POST'])
-@admin_required
-def toggle_pin_announcement(announcement_id):
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT is_pinned FROM announcements WHERE id = ?', (announcement_id,))
-        row = cursor.fetchone()
-        if not row:
-            conn.close()
-            return jsonify({'success': False, 'message': 'Announcement not found!'}), 404
-
-        new_pin = 0 if row[0] == 1 else 1
-        cursor.execute('UPDATE announcements SET is_pinned = ? WHERE id = ?', (new_pin, announcement_id))
-        conn.commit()
-        conn.close()
-
-        status_str = "PINNED" if new_pin == 1 else "UNPINNED"
-        app.logger.info(f"Admin toggled pin for announcement #{announcement_id} to {status_str}")
-        return jsonify({
-            'success': True,
-            'is_pinned': bool(new_pin),
-            'message': f'Announcement is now {status_str}.'
-        })
-    except Exception:
-        app.logger.exception(f"Error toggling pin for announcement #{announcement_id}")
-        return jsonify({'success': False, 'message': 'Failed to toggle announcement pin status.'}), 500
-
-# ==========================================
-# 8. DIGITAL PASS & PRIVACY-PROTECTED QR SCAN API
-# ==========================================
-@app.route('/api/pass/<qr_token>', methods=['GET'])
-def get_pass_details(qr_token):
-    """Accreditation pass verification endpoint. Strictly minimizes data for public lookups."""
-    try:
-        client_ip = get_client_ip()
-        if is_rate_limited(client_ip, 'pass_scan', limit=25, window_seconds=60):
-            return jsonify({'success': False, 'message': 'Rate limit exceeded! Please wait a minute.'}), 429
-
-        conn = get_db_connection()
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        clean_token = qr_token.strip()
-        cursor.execute('SELECT * FROM registrations WHERE qr_token = ?', (clean_token,))
-        row = cursor.fetchone()
-        conn.close()
-
-        if not row:
-            return jsonify({'success': False, 'message': 'Invalid or expired pass token.'}), 404
-
-        reg = dict(row)
-        reg.pop('screenshot_filename', None)
-        reg.pop('screenshot_filepath', None)
-
-        # Unauthenticated public response: Strictly minimal public event details (No PII, internal IDs, or DB paths)
-        if not session.get('is_admin'):
-            public_pass = {
-                'selected_game': reg['selected_game'],
-                'team_name': reg['team_name'],
-                'captain_name': reg['captain_name'],
-                'player2_name': reg.get('player2_name', ''),
-                'player3_name': reg.get('player3_name', ''),
-                'player4_name': reg.get('player4_name', ''),
-                'player5_name': reg.get('player5_name', ''),
-                'status': reg.get('status', 'PENDING_VERIFICATION'),
-                'qr_token': reg.get('qr_token', ''),
-                'checkin_status': reg.get('checkin_status', 'NOT_CHECKED_IN'),
-                'checkin_time': reg.get('checkin_time'),
-                'created_at': reg.get('created_at'),
-                'is_verified': reg.get('status') == 'VERIFIED'
-            }
-            return jsonify({'success': True, 'pass': public_pass})
-
-        # Authorized Administrator receives decrypted operational data
-        reg['captain_whatsapp'] = decrypt_field(reg.get('captain_whatsapp'))
-        reg['emergency_contact'] = decrypt_field(reg.get('emergency_contact'))
-        reg['captain_email'] = decrypt_field(reg.get('captain_email'))
-        reg['gamer_uid'] = decrypt_field(reg.get('gamer_uid'))
-        reg['district_booking_id'] = decrypt_field(reg.get('district_booking_id'))
-        reg['bms_booking_id'] = reg['district_booking_id']
-        return jsonify({'success': True, 'pass': reg})
-
-    except Exception:
-        app.logger.exception(f"Error fetching pass details for token '{qr_token}'")
-        return jsonify({'success': False, 'message': 'Failed to verify pass.'}), 500
-
-@app.route('/api/admin/checkin', methods=['POST'])
-@admin_required
-def process_checkin():
-    try:
-        client_ip = get_client_ip()
-        if is_rate_limited(client_ip, 'checkin', limit=60, window_seconds=60):
-            return jsonify({'success': False, 'message': 'Too many check-in attempts. Please slow down.'}), 429
-
-        data = request.get_json(silent=True) or {}
-        token = data.get('qr_token', '').strip()
-        staff_name = data.get('staff_name', 'Fiza Gate Marshal').strip()
-        force_verify = bool(data.get('force_verify_and_checkin'))
-
-        if not token:
-            return jsonify({'success': False, 'is_eligible': False, 'message': 'Missing QR pass token!'}), 400
-
-        if '/' in token:
-            token = token.rstrip('/').rsplit('/', 1)[-1].strip()
-
-        conn = get_db_connection()
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-
-        cursor.execute('SELECT * FROM registrations WHERE qr_token = ?', (token,))
-        row = cursor.fetchone()
-
-        if not row:
-            conn.close()
-            return jsonify({
-                'success': False,
-                'is_eligible': False,
-                'status_code': 'INVALID_PASS',
-                'message': 'INVALID PASS: No athlete registration found for scanned QR code.'
-            }), 404
-
-        reg = dict(row)
-        reg_id = reg['id']
-
-        reg['captain_whatsapp'] = decrypt_field(reg.get('captain_whatsapp'))
-        reg['emergency_contact'] = decrypt_field(reg.get('emergency_contact'))
-        reg['captain_email'] = decrypt_field(reg.get('captain_email'))
-        reg['gamer_uid'] = decrypt_field(reg.get('gamer_uid'))
-        reg['district_booking_id'] = decrypt_field(reg.get('district_booking_id'))
-        reg['bms_booking_id'] = reg['district_booking_id']
-
-        if reg.get('status') != 'VERIFIED':
-            if force_verify:
-                cursor.execute("UPDATE registrations SET status = 'VERIFIED' WHERE id = ?", (reg_id,))
-                conn.commit()
-                reg['status'] = 'VERIFIED'
-                cap_email = reg.get('captain_email')
-                dist_id = reg.get('district_booking_id')
-                fmt_id = f"AX-2026-{reg_id:04d}"
-                threading.Thread(
-                    target=send_qr_email,
-                    args=(
-                        cap_email, reg['captain_name'], reg['team_name'],
-                        reg['selected_game'], fmt_id, reg.get('qr_token', ''),
-                        dist_id
-                    ),
-                    kwargs={'is_approval': True},
-                    daemon=True
-                ).start()
-            else:
-                conn.close()
-                return jsonify({
-                    'success': False,
-                    'is_eligible': False,
-                    'status_code': 'UNVERIFIED_PAYMENT',
-                    'message': f"PAYMENT UNVERIFIED: Proof for Team '{reg['team_name']}' is pending audit. Player is NOT ELIGIBLE yet.",
-                    'registration': reg
-                }), 400
-
-        if reg.get('checkin_status') == 'CHECKED_IN':
-            conn.close()
-            return jsonify({
-                'success': False,
-                'is_eligible': False,
-                'status_code': 'ALREADY_CHECKED_IN',
-                'message': f"ALREADY CHECKED IN: Team '{reg['team_name']}' pass was scanned at {reg.get('checkin_time', 'earlier time')}.",
-                'registration': reg
-            }), 409
-
-        now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
-        cursor.execute('''
-            UPDATE registrations
-            SET checkin_status = 'CHECKED_IN', checkin_time = ?, checked_in_by = ?
-            WHERE id = ?
-        ''', (now_str, staff_name, reg_id))
-        conn.commit()
-        conn.close()
-
-        reg['checkin_status'] = 'CHECKED_IN'
-        reg['checkin_time'] = now_str
-        app.logger.info(f"Gate Check-in successful for team '{reg['team_name']}' by {staff_name}")
-
-        return jsonify({
-            'success': True,
-            'is_eligible': True,
-            'status_code': 'CHECKIN_SUCCESS',
-            'message': f"ELIGIBLE & ADMITTED: Welcome Team '{reg['team_name']}' ({reg['selected_game']}) to ARENA X 2026.",
-            'registration': reg
-        })
-
-    except Exception:
-        app.logger.exception("Error processing gate check-in")
-        return jsonify({'success': False, 'is_eligible': False, 'message': 'Failed to process check-in.'}), 500
-
-# ==========================================
-# 9. DATABASE SECURITY & SYSTEM AUDIT API
-# ==========================================
-@app.route('/api/admin/security-audit', methods=['GET'])
-@admin_required
-def get_security_audit():
-    """Provides administrative real-time cybersecurity diagnostic audit."""
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('PRAGMA journal_mode')
-        journal_mode = cursor.fetchone()[0]
-        cursor.execute('PRAGMA secure_delete')
-        secure_del = cursor.fetchone()[0]
-        cursor.execute('SELECT COUNT(*) FROM registrations')
-        total_regs = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM registrations WHERE captain_email LIKE 'ENC:%'")
-        encrypted_regs = cursor.fetchone()[0]
-        conn.close()
-
-        return jsonify({
-            'success': True,
-            'database_security': {
-                'password_configured': bool(DB_PASSWORD),
-                'journal_mode': journal_mode,
-                'secure_delete_enabled': bool(secure_del),
-                'encryption_standard': 'AES-256 (Fernet) via PBKDF2-HMAC-SHA256 (200,000 iterations)',
-                'database_status': 'PROTECTED & HARDENED',
-                'total_registrations': total_regs,
-                'encrypted_pii_records': encrypted_regs,
-                'integrity_status': 'PROTECTED & HARDENED'
-            },
-            'endpoint_security': {
-                'static_route_filtering': 'STRICT_WHITELIST',
-                'constant_time_passkey': True,
-                'rate_limiting_active': True,
-                'pii_redaction_on_pass': True,
-                'image_magic_header_validation': True,
-                'csrf_protection_active': True,
-                'local_qr_generation': True
-            }
-        })
-    except Exception:
-        app.logger.exception("Error generating security audit")
-        return jsonify({'success': False, 'message': 'Failed to generate security audit.'}), 500
-
-# ==========================================
-# 10. ADMIN DASHBOARD & GATE TEMPLATES
-# ==========================================
-
-LOGIN_HTML = '''<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ARENA X // Organizers Security Gate</title>
-    <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;700&family=Orbitron:wght@600;800;900&family=Inter:wght@400;600&display=swap" rel="stylesheet">
+    <title>ARENA X 2026 // Real-Time Organizers Command Center</title>
+    <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Orbitron:wght@600;800;900&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
+        /* Base & Shared Styles */
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
             background: #040714;
             color: #ffffff;
             font-family: 'Inter', sans-serif;
             min-height: 100vh;
+        }
+
+        /* Login Screen Specific Styles */
+        #admin-login-screen {
+            min-height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
             padding: 20px;
+            background: radial-gradient(circle at center, rgba(0, 243, 255, 0.06) 0%, #040714 85%);
         }
         .login-card {
             background: rgba(10, 14, 28, 0.95);
             border: 2px solid rgba(0, 243, 255, 0.4);
             border-radius: 16px;
-            max-width: 440px;
+            max-width: 450px;
             width: 100%;
-            padding: 35px 30px;
+            padding: 38px 30px;
             text-align: center;
             box-shadow: 0 0 50px rgba(0, 243, 255, 0.2), inset 0 0 20px rgba(0, 243, 255, 0.05);
             backdrop-filter: blur(14px);
         }
         .lock-icon {
-            font-size: 3rem;
+            font-size: 3.2rem;
             color: #00f3ff;
             filter: drop-shadow(0 0 15px #00f3ff);
-            margin-bottom: 15px;
+            margin-bottom: 18px;
         }
-        h2 {
+        .login-card h2 {
             font-family: 'Orbitron', sans-serif;
-            font-size: 1.4rem;
+            font-size: 1.45rem;
             color: #00f3ff;
             letter-spacing: 2px;
             margin-bottom: 8px;
         }
-        p {
+        .login-card p {
             color: #94a3b8;
             font-size: 0.85rem;
             margin-bottom: 24px;
+            line-height: 1.5;
         }
         .input-group {
             margin-bottom: 20px;
@@ -2070,75 +112,33 @@ LOGIN_HTML = '''<!DOCTYPE html>
             display: inline-block;
             margin-top: 20px;
             color: #94a3b8;
-            font-size: 0.8rem;
+            font-size: 0.82rem;
             text-decoration: none;
+            transition: color 0.2s;
         }
         .btn-home:hover { color: #00f3ff; }
-    </style>
-</head>
-<body>
-    <div class="login-card">
-        <i class="fa-solid fa-shield-halved lock-icon"></i>
-        <h2>ORGANIZERS ACCESS</h2>
-        <p>Restricted Area &bull; Enter security passkey to access live registrations dashboard</p>
 
-        <form onsubmit="handleLogin(event)">
-            <div class="input-group">
-                <label>ADMIN SECURITY PASSKEY</label>
-                <input type="password" id="passkey-input" class="pass-input" placeholder="••••••••••••" required autofocus>
-            </div>
-            <button type="submit" class="btn-submit" id="submit-btn">
-                <i class="fa-solid fa-key"></i> UNLOCK COMMAND CENTER
-            </button>
-            <div id="error-box" class="error-msg">Access Denied: Incorrect Security Passkey</div>
-        </form>
-        <a href="/" class="btn-home"><i class="fa-solid fa-arrow-left"></i> Return to Public Portal</a>
-    </div>
-
-    <script>
-        async function handleLogin(e) {
-            e.preventDefault();
-            const passkey = document.getElementById('passkey-input').value;
-            const btn = document.getElementById('submit-btn');
-            const err = document.getElementById('error-box');
-
-            btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Verifying...';
-            btn.disabled = true;
-            err.style.display = 'none';
-
-            try {
-                const res = await fetch('/api/admin/login', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ passkey })
-                });
-                const data = await res.json();
-                if (res.ok && data.success) {
-                    window.location.reload();
-                } else {
-                    err.style.display = 'block';
-                }
-            } catch(e) {
-                err.innerText = 'Server connection error. Please try again.';
-                err.style.display = 'block';
-            } finally {
-                btn.innerHTML = '<i class="fa-solid fa-key"></i> UNLOCK COMMAND CENTER';
-                btn.disabled = false;
-            }
+        /* Environment / Status Notice */
+        .preview-mode-banner {
+            display: none;
+            background: rgba(255, 170, 0, 0.15);
+            border: 1px solid #ffaa00;
+            color: #ffcc00;
+            padding: 10px 20px;
+            font-size: 0.82rem;
+            text-align: center;
+            font-family: 'Orbitron', sans-serif;
+            letter-spacing: 0.5px;
+            border-radius: 8px;
+            margin: 15px 25px 0 25px;
         }
-    </script>
-</body>
-</html>'''
+        .preview-mode-banner a {
+            color: #00f3ff;
+            text-decoration: underline;
+        }
 
-DASHBOARD_HTML = '''<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ARENA X 2026 // Real-Time Organizers Command Center</title>
-    <link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=Orbitron:wght@600;800;900&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <style>
+        /* Dashboard Styles */
+
         :root {
             --bg-dark: #040714;
             --card-bg: rgba(10, 14, 28, 0.95);
@@ -2483,10 +483,39 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
             font-size: 1.5rem;
             cursor: pointer;
         }
+    
     </style>
-    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 </head>
 <body>
+
+    <!-- 1. LOGIN GATE VIEW -->
+    <div id="admin-login-screen">
+        <div class="login-card">
+            <i class="fa-solid fa-shield-halved lock-icon"></i>
+            <h2>ORGANIZERS ACCESS</h2>
+            <p>Restricted Area &bull; Enter security passkey to access live registrations dashboard</p>
+
+            <form onsubmit="handleLogin(event)">
+                <div class="input-group">
+                    <label>ADMIN SECURITY PASSKEY</label>
+                    <input type="password" id="passkey-input" class="pass-input" placeholder="••••••••••••" required autofocus>
+                </div>
+                <button type="submit" class="btn-submit" id="submit-btn">
+                    <i class="fa-solid fa-key"></i> UNLOCK COMMAND CENTER
+                </button>
+                <div id="error-box" class="error-msg">Access Denied: Incorrect Security Passkey</div>
+            </form>
+            <a href="/" class="btn-home"><i class="fa-solid fa-arrow-left"></i> Return to Public Portal</a>
+        </div>
+    </div>
+
+    <!-- 2. COMMAND CENTER DASHBOARD VIEW -->
+    <div id="admin-dashboard-screen" style="display: none;">
+        <div id="preview-banner" class="preview-mode-banner">
+            <i class="fa-solid fa-cloud"></i> <strong>CLOUDFLARE STATIC PREVIEW MODE:</strong> Python backend is currently disconnected or running on another host.
+            To manage live registrations, deploy the Flask service on your Hostinger KVM 1 VPS.
+        </div>
+        
 
     <header class="admin-header">
         <div class="header-title">
@@ -3077,7 +1106,11 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 
             } catch(err) {
                 console.error("Camera startup error:", err);
-                alert(`WARNING: Live Camera Permission Error / Access Blocked!\n\nMOBILE TIP: Mobile browsers require HTTPS or localhost for live camera stream.\n\nYou can also use the 'Photo / Scan File' button to take a photo of the QR code with your phone camera or select an image!`);
+                alert(`WARNING: Live Camera Permission Error / Access Blocked!
+
+MOBILE TIP: Mobile browsers require HTTPS or localhost for live camera stream.
+
+You can also use the 'Photo / Scan File' button to take a photo of the QR code with your phone camera or select an image!`);
                 scannerBox.style.display = 'none';
                 if (camSelect) camSelect.style.display = 'none';
                 toggleBtn.innerHTML = `<i class="fa-solid fa-camera"></i> Launch Live Camera Scanner`;
@@ -3483,7 +1516,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
                     r.qr_token || ''
                 ]);
             });
-            const csvContent = '\ufeff' + rows.map(e => e.map(val => `"${String(val).replace(/"/g, '""')}"`).join(',')).join('\\n');
+            const csvContent = '﻿' + rows.map(e => e.map(val => `"${String(val).replace(/"/g, '""')}"`).join(',')).join('\n');
             const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
             const link = document.createElement('a');
             link.href = URL.createObjectURL(blob);
@@ -3975,116 +2008,145 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
         setInterval(loadAdminMatches, 5000);
         setInterval(loadAdminAnnouncements, 10000);
     </script>
+
+    </div>
+
+    <script>
+        // Universal Admin Gate Controller
+        let isStaticMode = false;
+
+        async function checkExistingAuth() {
+            // 1. Check if backend session is active
+            try {
+                const res = await fetch('/api/admin/csrf-token');
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data && data.csrf_token) {
+                        window.CSRF_TOKEN = data.csrf_token;
+                        showDashboardView(false);
+                        return;
+                    }
+                }
+            } catch(e) {}
+
+            // 2. Check session storage for authorized passkey
+            const cachedPass = sessionStorage.getItem('arena_admin_pass');
+            if (cachedPass) {
+                // Attempt login with cached passkey
+                try {
+                    const res = await fetch('/api/admin/login', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ passkey: cachedPass })
+                    });
+                    const data = await res.json();
+                    if (res.ok && data.success) {
+                        showDashboardView(false);
+                        return;
+                    }
+                } catch(e) {
+                    // Offline / Static Preview
+                    if (cachedPass === 'arenax2026') {
+                        showDashboardView(true);
+                        return;
+                    }
+                }
+            }
+
+            // Otherwise stay on login screen
+            showLoginView();
+        }
+
+        function showLoginView() {
+            document.getElementById('admin-login-screen').style.display = 'flex';
+            document.getElementById('admin-dashboard-screen').style.display = 'none';
+        }
+
+        function showDashboardView(staticMode = false) {
+            isStaticMode = staticMode;
+            document.getElementById('admin-login-screen').style.display = 'none';
+            document.getElementById('admin-dashboard-screen').style.display = 'block';
+
+            const banner = document.getElementById('preview-banner');
+            if (banner) {
+                banner.style.display = staticMode ? 'block' : 'none';
+            }
+
+            // Initialize Dashboard Data
+            if (typeof loadRegistrations === 'function') loadRegistrations();
+            if (typeof loadAdminMatches === 'function') loadAdminMatches();
+            if (typeof loadGameStatuses === 'function') loadGameStatuses();
+            if (typeof loadAdminAnnouncements === 'function') loadAdminAnnouncements();
+
+            if (!staticMode) {
+                setInterval(() => {
+                    if (typeof loadAdminMatches === 'function') loadAdminMatches();
+                }, 5000);
+                setInterval(() => {
+                    if (typeof loadAdminAnnouncements === 'function') loadAdminAnnouncements();
+                }, 10000);
+            }
+        }
+
+        async function handleLogin(e) {
+            e.preventDefault();
+            const passkeyInput = document.getElementById('passkey-input');
+            const passkey = passkeyInput ? passkeyInput.value.trim() : '';
+            const btn = document.getElementById('submit-btn');
+            const err = document.getElementById('error-box');
+
+            if (!passkey) return;
+
+            btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Verifying...';
+            btn.disabled = true;
+            err.style.display = 'none';
+
+            try {
+                const res = await fetch('/api/admin/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ passkey })
+                });
+                const data = await res.json();
+
+                if (res.ok && data.success) {
+                    sessionStorage.setItem('arena_admin_pass', passkey);
+                    showDashboardView(false);
+                    return;
+                } else {
+                    err.innerText = data.message || 'Access Denied: Incorrect Security Passkey';
+                    err.style.display = 'block';
+                }
+            } catch(errNet) {
+                // Server connection error (e.g. static Cloudflare Pages hosting)
+                // Test passkey for organizer preview mode
+                if (passkey === 'arenax2026') {
+                    sessionStorage.setItem('arena_admin_pass', passkey);
+                    showDashboardView(true);
+                    return;
+                } else {
+                    err.innerText = 'Access Denied: Incorrect Security Passkey';
+                    err.style.display = 'block';
+                }
+            } finally {
+                btn.innerHTML = '<i class="fa-solid fa-key"></i> UNLOCK COMMAND CENTER';
+                btn.disabled = false;
+            }
+        }
+
+        async function handleAdminLogout() {
+            try {
+                await fetch('/api/admin/logout', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': window.CSRF_TOKEN || '' },
+                    body: JSON.stringify({ csrf_token: window.CSRF_TOKEN || '' })
+                });
+            } catch(e) {}
+            sessionStorage.removeItem('arena_admin_pass');
+            showLoginView();
+        }
+
+        window.addEventListener('DOMContentLoaded', checkExistingAuth);
+    </script>
 </body>
-</html>'''
-
-@app.route('/admin')
-@app.route('/admin.html')
-def admin_portal():
-    if not session.get('is_admin'):
-        return LOGIN_HTML
-
-    # Session expiration verification (30-min idle timeout + 4-hr maximum lifetime)
-    now = time.time()
-    login_time = session.get('login_time')
-    last_activity = session.get('last_activity', login_time or now)
-    lifetime_sec = app.config['PERMANENT_SESSION_LIFETIME'].total_seconds()
-    idle_limit_sec = 30 * 60
-
-    if (now - last_activity > idle_limit_sec) or (login_time and (now - login_time > lifetime_sec)):
-        app.logger.info(f"Admin session timed out on page access from {get_client_ip()}")
-        session.clear()
-        return LOGIN_HTML
-
-    session['last_activity'] = now
-
-    if 'csrf_token' not in session:
-        session['csrf_token'] = secrets.token_hex(32)
-
-    csrf_script = f'''<script>
-window.CSRF_TOKEN = "{session['csrf_token']}";
-(function() {{
-    const _origFetch = window.fetch;
-    window.fetch = async function(resource, init) {{
-        init = init || {{}};
-        const method = (init.method || 'GET').toUpperCase();
-        if (['POST', 'PUT', 'DELETE', 'PATCH'].includes(method)) {{
-            init.headers = init.headers || {{}};
-            if (!window.CSRF_TOKEN) {{
-                try {{
-                    const csrfRes = await _origFetch('/api/admin/csrf-token');
-                    const csrfData = await csrfRes.json();
-                    if (csrfData && csrfData.csrf_token) {{
-                        window.CSRF_TOKEN = csrfData.csrf_token;
-                    }}
-                }} catch(e) {{}}
-            }}
-            const token = window.CSRF_TOKEN || '';
-            if (token) {{
-                if (init.headers instanceof Headers) {{
-                    if (!init.headers.has('X-CSRF-Token')) {{
-                        init.headers.set('X-CSRF-Token', token);
-                    }}
-                }} else if (Array.isArray(init.headers)) {{
-                    init.headers.push(['X-CSRF-Token', token]);
-                }} else {{
-                    if (!init.headers['X-CSRF-Token']) {{
-                        init.headers['X-CSRF-Token'] = token;
-                    }}
-                }}
-            }}
-        }}
-
-        let response = await _origFetch.call(this, resource, init);
-
-        if (response.status === 403 && ['POST', 'PUT', 'DELETE', 'PATCH'].includes(method) && !init._retried) {{
-            try {{
-                const clone = response.clone();
-                const errData = await clone.json();
-                if (errData && errData.message && errData.message.toLowerCase().includes('security token')) {{
-                    const csrfRes = await _origFetch('/api/admin/csrf-token');
-                    const csrfData = await csrfRes.json();
-                    if (csrfData && csrfData.csrf_token) {{
-                        window.CSRF_TOKEN = csrfData.csrf_token;
-                        if (init.headers instanceof Headers) {{
-                            init.headers.set('X-CSRF-Token', window.CSRF_TOKEN);
-                        }} else if (Array.isArray(init.headers)) {{
-                            init.headers = init.headers.filter(h => h[0] !== 'X-CSRF-Token');
-                            init.headers.push(['X-CSRF-Token', window.CSRF_TOKEN]);
-                        }} else {{
-                            init.headers['X-CSRF-Token'] = window.CSRF_TOKEN;
-                        }}
-                        init._retried = true;
-                        response = await _origFetch.call(this, resource, init);
-                    }}
-                }}
-            }} catch(e) {{}}
-        }}
-
-        return response;
-    }};
-}})();
-
-async function handleAdminLogout() {{
-    try {{
-        await fetch('/api/admin/logout', {{
-            method: 'POST',
-            headers: {{ 'Content-Type': 'application/json', 'X-CSRF-Token': window.CSRF_TOKEN }},
-            body: JSON.stringify({{ csrf_token: window.CSRF_TOKEN }})
-        }});
-    }} catch(e) {{
-        console.error('Logout error:', e);
-    }}
-    window.location.href = '/admin';
-}}
-</script></head>'''
-
-    return DASHBOARD_HTML.replace('</head>', csrf_script)
-
-if __name__ == '__main__':
-    is_debug = os.environ.get('FLASK_DEBUG', 'False').lower() in ('true', '1')
-    if IS_PRODUCTION:
-        is_debug = False  # Strictly prevent debug mode in production
-    bind_host = '127.0.0.1' if IS_PRODUCTION else '0.0.0.0'
-    print(f"ARENA X Security-Hardened Python Server running on http://{bind_host}:5000 (Production: {IS_PRODUCTION}, Debug: {is_debug}) ...")
-    app.run(host=bind_host, port=5000, debug=is_debug)
+</html>
