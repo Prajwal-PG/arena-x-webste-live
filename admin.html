@@ -635,18 +635,11 @@
                 <div class="input-group">
                     <label><i class="fa-solid fa-key"></i> SECURITY PASSKEY</label>
                     <div class="pass-input-wrapper">
-                        <input type="password" id="passkey-input" class="pass-input" placeholder="Enter passkey (e.g. arenax2026)" required autofocus autocomplete="current-password">
+                        <input type="password" id="passkey-input" class="pass-input" placeholder="••••••••••••" required autofocus autocomplete="current-password">
                         <button type="button" class="btn-toggle-eye" onclick="togglePassVisibility()" title="Show/Hide Passkey" aria-label="Toggle Passkey Visibility">
                             <i class="fa-solid fa-eye" id="eye-icon"></i>
                         </button>
                     </div>
-                </div>
-
-                <div class="quick-pass-row">
-                    <span class="quick-label">DEFAULT PASS:</span>
-                    <button type="button" class="quick-key-btn" onclick="fillPass('arenax2026')">
-                        <i class="fa-solid fa-bolt"></i> arenax2026
-                    </button>
                 </div>
 
                 <button type="submit" class="btn-submit" id="submit-btn">
@@ -660,10 +653,6 @@
 
     <!-- 2. COMMAND CENTER DASHBOARD VIEW -->
     <div id="admin-dashboard-screen" style="display: none;">
-        <div id="preview-banner" class="preview-mode-banner">
-            <i class="fa-solid fa-cloud"></i> <strong>CLOUDFLARE STATIC PREVIEW MODE:</strong> Python backend is currently disconnected or running on another host.
-            To manage live registrations, deploy the Flask service on your Hostinger KVM 1 VPS.
-        </div>
         
 
     <header class="admin-header">
@@ -2215,28 +2204,10 @@ You can also use the 'Photo / Scan File' button to take a photo of the QR code w
                 }
             } catch(e) {}
 
-            // 2. Check session storage for authorized passkey
-            const cachedPass = sessionStorage.getItem('arena_admin_pass');
-            if (cachedPass) {
-                // Attempt login with cached passkey
-                try {
-                    const res = await fetch('/api/admin/login', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ passkey: cachedPass })
-                    });
-                    const data = await res.json();
-                    if (res.ok && data.success) {
-                        showDashboardView(false);
-                        return;
-                    }
-                } catch(e) {
-                    // Offline / Static Preview
-                    if (cachedPass === 'arenax2026') {
-                        showDashboardView(true);
-                        return;
-                    }
-                }
+            // 2. Check session storage for authenticated session
+            if (sessionStorage.getItem('arena_admin_auth') === 'true') {
+                showDashboardView();
+                return;
             }
 
             // Otherwise stay on login screen
@@ -2248,15 +2219,9 @@ You can also use the 'Photo / Scan File' button to take a photo of the QR code w
             document.getElementById('admin-dashboard-screen').style.display = 'none';
         }
 
-        function showDashboardView(staticMode = false) {
-            isStaticMode = staticMode;
+        function showDashboardView() {
             document.getElementById('admin-login-screen').style.display = 'none';
             document.getElementById('admin-dashboard-screen').style.display = 'block';
-
-            const banner = document.getElementById('preview-banner');
-            if (banner) {
-                banner.style.display = staticMode ? 'block' : 'none';
-            }
 
             // Initialize Dashboard Data
             if (typeof loadLiveRegistrations === 'function') loadLiveRegistrations();
@@ -2291,14 +2256,6 @@ You can also use the 'Photo / Scan File' button to take a photo of the QR code w
             }
         }
 
-        function fillPass(k) {
-            const input = document.getElementById('passkey-input');
-            if (input) {
-                input.value = k;
-                input.focus();
-            }
-        }
-
         async function handleLogin(e) {
             e.preventDefault();
             const passkeyInput = document.getElementById('passkey-input');
@@ -2321,7 +2278,7 @@ You can also use the 'Photo / Scan File' button to take a photo of the QR code w
                 const data = await res.json();
 
                 if (res.ok && data.success) {
-                    sessionStorage.setItem('arena_admin_pass', passkey);
+                    sessionStorage.setItem('arena_admin_auth', 'true');
                     showDashboardView(false);
                     return;
                 } else {
@@ -2329,17 +2286,8 @@ You can also use the 'Photo / Scan File' button to take a photo of the QR code w
                     err.style.display = 'block';
                 }
             } catch(errNet) {
-                // Server connection error (e.g. static Cloudflare Pages hosting)
-                // Test passkey for organizer preview mode
-                const validStaticKeys = ['arenax2026', 'arenax@2026', 'arena2026', 'arenaxpass'];
-                if (validStaticKeys.includes(passkey.toLowerCase())) {
-                    sessionStorage.setItem('arena_admin_pass', passkey);
-                    showDashboardView(true);
-                    return;
-                } else {
-                    err.innerText = 'Access Denied: Incorrect Security Passkey';
-                    err.style.display = 'block';
-                }
+                err.innerText = 'Access Denied: Authentication server unreachable or invalid passkey.';
+                err.style.display = 'block';
             } finally {
                 btn.innerHTML = '<i class="fa-solid fa-shield-halved"></i> UNLOCK COMMAND CENTER';
                 btn.disabled = false;
@@ -2354,6 +2302,7 @@ You can also use the 'Photo / Scan File' button to take a photo of the QR code w
                     body: JSON.stringify({ csrf_token: window.CSRF_TOKEN || '' })
                 });
             } catch(e) {}
+            sessionStorage.removeItem('arena_admin_auth');
             sessionStorage.removeItem('arena_admin_pass');
             showLoginView();
         }

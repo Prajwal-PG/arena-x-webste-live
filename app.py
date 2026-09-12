@@ -2229,18 +2229,11 @@ LOGIN_HTML = '''<!DOCTYPE html>
             <div class="input-group">
                 <label><i class="fa-solid fa-key"></i> SECURITY PASSKEY</label>
                 <div class="pass-input-wrapper">
-                    <input type="password" id="passkey-input" class="pass-input" placeholder="Enter passkey (e.g. arenax2026)" required autofocus autocomplete="current-password">
+                    <input type="password" id="passkey-input" class="pass-input" placeholder="••••••••••••" required autofocus autocomplete="current-password">
                     <button type="button" class="btn-toggle-eye" onclick="togglePassVisibility()" title="Show/Hide Passkey" aria-label="Toggle Passkey Visibility">
                         <i class="fa-solid fa-eye" id="eye-icon"></i>
                     </button>
                 </div>
-            </div>
-
-            <div class="quick-pass-row">
-                <span class="quick-label">DEFAULT PASS:</span>
-                <button type="button" class="quick-key-btn" onclick="fillPass('arenax2026')">
-                    <i class="fa-solid fa-bolt"></i> arenax2026
-                </button>
             </div>
 
             <button type="submit" class="btn-submit" id="submit-btn">
@@ -2266,14 +2259,6 @@ LOGIN_HTML = '''<!DOCTYPE html>
                 icon.classList.remove('fa-eye-slash');
                 icon.classList.add('fa-eye');
                 icon.style.color = '#64748b';
-            }
-        }
-
-        function fillPass(k) {
-            const input = document.getElementById('passkey-input');
-            if (input) {
-                input.value = k;
-                input.focus();
             }
         }
 
