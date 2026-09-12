@@ -1098,38 +1098,7 @@
             } catch(e) {
                 console.error("Error loading registrations:", e);
                 if (isStaticMode && (!allRegistrations || allRegistrations.length === 0)) {
-                    allRegistrations = [
-                        {
-                            id: 1,
-                            team_name: "CYBER DRAGONS",
-                            captain_name: "Prajwal PG",
-                            selected_game: "Valorant",
-                            phone: "+91 9632302188",
-                            alt_phone: "+91 9632302188",
-                            email: "prajwalzone68@gmail.com",
-                            gamer_uid: "#12345",
-                            bms_booking_id: "WXYZ123456",
-                            status: "VERIFIED",
-                            checkin_status: "CHECKED_IN",
-                            created_at: new Date().toISOString(),
-                            screenshot_url: "dummy_zomato_booking.png"
-                        },
-                        {
-                            id: 2,
-                            team_name: "NEON STRIKERS",
-                            captain_name: "Rahul K",
-                            selected_game: "BGMI",
-                            phone: "+91 9876543210",
-                            alt_phone: "+91 9876543211",
-                            email: "rahul.striker@gmail.com",
-                            gamer_uid: "5123984712",
-                            bms_booking_id: "BMS789012",
-                            status: "PENDING_VERIFICATION",
-                            checkin_status: "NOT_CHECKED_IN",
-                            created_at: new Date().toISOString(),
-                            screenshot_url: "dummy_zomato_booking.png"
-                        }
-                    ];
+                    allRegistrations = [];
                     updateStats();
                     filterTable();
                 }
@@ -1155,7 +1124,7 @@
         function renderTable(list) {
             const tbody = document.getElementById('registrations-body');
             if (!list || list.length === 0) {
-                tbody.innerHTML = `<tr><td colspan="10" style="text-align: center; color: #94a3b8; padding: 40px;">No registrations match your search filter.</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="10" style="text-align: center; color: #94a3b8; padding: 48px; font-family: 'Chakra Petch', sans-serif;"><i class="fa-solid fa-folder-open" style="font-size: 2rem; display: block; margin-bottom: 12px; color: #475569;"></i>No registrations recorded yet. Live entries will appear here.</td></tr>`;
                 return;
             }
 
