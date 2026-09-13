@@ -2241,11 +2241,14 @@ You can also use the 'Photo / Scan File' button to take a photo of the QR code w
                     window.CSRF_TOKEN = data.csrf_token;
                     showDashboardView();
                     return;
+                } else if (res.status === 401) {
+                    err.innerText = data.message || 'Invalid admin credentials.';
+                    err.style.display = 'block';
                 } else if (res.status === 429) {
                     err.innerText = data.message || 'Too many failed login attempts! Please wait 15 minutes before trying again.';
                     err.style.display = 'block';
                 } else {
-                    err.innerText = data.message || 'Invalid admin credentials.';
+                    err.innerText = 'Admin server unavailable. Please try again.';
                     err.style.display = 'block';
                 }
             } catch(errNet) {
