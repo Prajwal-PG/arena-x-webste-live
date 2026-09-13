@@ -687,7 +687,7 @@ def get_smtp_config():
     except ValueError:
         port = 587
     username = os.environ.get('SMTP_USERNAME', '').strip()
-    password = os.environ.get('SMTP_PASSWORD', '').strip()
+    password = os.environ.get('SMTP_PASSWORD', '').strip().replace(' ', '')
     sender = os.environ.get('SENDER_EMAIL', username).strip()
     return server, port, username, password, sender
 
