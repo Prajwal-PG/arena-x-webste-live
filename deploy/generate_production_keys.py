@@ -35,44 +35,12 @@ def main():
     print(f"SECRET_KEY={secret_key}")
     print(f"ARENA_ADMIN_KEY={admin_key}")
     print(f"DB_PASSWORD={db_password}")
-
-    output_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env.production.sample')
-    template = f"""# ==============================================================================
-# ARENA X 2026 // Production Secrets Template
-# Rename or copy to /var/www/arena_x/.env on your production VPS
-# Permissions: chmod 600 /var/www/arena_x/.env && chown www-data:www-data /var/www/arena_x/.env
-# ==============================================================================
-
-FLASK_ENV=production
-SESSION_COOKIE_SECURE=true
-SECRET_KEY={secret_key}
-ARENA_ADMIN_KEY={admin_key}
-DB_PASSWORD={db_password}
-
-# Gmail SMTP Delivery Credentials
-SMTP_SERVER=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USERNAME=your-production-email@gmail.com
-SMTP_PASSWORD=<CONFIGURE_YOUR_16_CHAR_GMAIL_APP_PASSWORD>
-SENDER_EMAIL=your-production-email@gmail.com
-REPLY_TO_EMAIL=your-production-email@gmail.com
-
-# Cloudflare Proxy Integration
-TRUST_CLOUDFLARE_IP=true
-TRUSTED_PROXIES=127.0.0.1,::1
-
-# Shared Rate Limiting (Redis)
-REDIS_URL=redis://127.0.0.1:6379/0
-
-# Allowed CORS Origins (Replace with your actual domain)
-ALLOWED_ORIGINS=https://arenax.in,https://www.arenax.in
-"""
-
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(template)
-
-    print(f"\n[OK] Sample production file created at: {output_path}")
-    print("[NOTE] Never commit this file or your actual .env to public Git repositories.")
+    print("\n[INSTRUCTIONS]")
+    print("1. Copy .env.production.sample to /var/www/arena_x/.env on your Hostinger VPS.")
+    print("2. Paste the generated SECRET_KEY, ARENA_ADMIN_KEY, and DB_PASSWORD into /var/www/arena_x/.env.")
+    print("3. Set your production domain, Gmail address, and Gmail App Password.")
+    print("4. Restrict permissions: chmod 600 /var/www/arena_x/.env && chown www-data:www-data /var/www/arena_x/.env")
+    print("5. NEVER commit your live .env to public Git repositories.")
     print("=" * 70)
 
 if __name__ == '__main__':

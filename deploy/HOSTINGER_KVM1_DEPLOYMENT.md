@@ -62,33 +62,58 @@ bash deploy/hostinger_kvm1_setup.sh
 
 ## 5. Configure Your Production `.env`
 
-Create `/var/www/arena_x/.env`:
+Copy the production sample template:
+```bash
+cp /var/www/arena_x/.env.production.sample /var/www/arena_x/.env
+```
+
+Generate fresh, high-entropy cryptographic keys:
+```bash
+/var/www/arena_x/venv/bin/python /var/www/arena_x/deploy/generate_production_keys.py
+```
+
+Edit `/var/www/arena_x/.env`:
 ```bash
 nano /var/www/arena_x/.env
 ```
 
-Paste your production secrets:
+Ensure all keys, domains, and credentials are configured:
 ```ini
-# Flask Security Keys
-SECRET_KEY=<generate_with_python_deploy/generate_production_keys.py>
-ARENA_ADMIN_KEY=<choose_a_strong_admin_passkey>
-DB_PASSWORD=<choose_a_strong_database_passphrase>
+# Flask Core & Security
+FLASK_ENV=production
+FLASK_DEBUG=false
+SESSION_COOKIE_SECURE=true
+
+# High-Entropy Cryptographic Keys (Generated via deploy/generate_production_keys.py)
+SECRET_KEY=<INSERT_GENERATED_SECRET_KEY>
+ARENA_ADMIN_KEY=<INSERT_GENERATED_ADMIN_KEY>
+DB_PASSWORD=<INSERT_GENERATED_DB_PASSWORD>
+
+# Reverse Proxy & Cloudflare IP Trust
+BEHIND_PROXY=true
+PROXIES_COUNT=1
+TRUST_CLOUDFLARE_IP=true
+TRUSTED_PROXIES=127.0.0.1,::1
+
+# Strict CORS Allowlist (No wildcards)
+ALLOWED_ORIGINS=https://YOUR-DOMAIN.com,https://www.YOUR-DOMAIN.com
+
+# Redis Shared Sliding-Window Rate Limiter
+REDIS_URL=redis://127.0.0.1:6379/0
 
 # Gmail SMTP Configuration
 SMTP_SERVER=smtp.gmail.com
 SMTP_PORT=587
 SMTP_USERNAME=your-production-email@gmail.com
-SMTP_PASSWORD=<configure_your_16_char_google_app_password>
+SMTP_PASSWORD=<YOUR_16_CHAR_GMAIL_APP_PASSWORD>
 SENDER_EMAIL=your-production-email@gmail.com
-
-# Cloudflare Proxy Integration
-TRUST_CLOUDFLARE_IP=true
+REPLY_TO_EMAIL=your-production-email@gmail.com
 ```
 
-Set secure file permissions:
+Set secure file permissions (readable only by root and www-data):
 ```bash
-chown www-data:www-data /var/www/arena_x/.env
-chmod 600 /var/www/arena_x/.env
+chown root:www-data /var/www/arena_x/.env
+chmod 640 /var/www/arena_x/.env
 ```
 
 ---
@@ -106,13 +131,29 @@ Check Nginx and Gunicorn logs:
 # Service status
 systemctl is-active arena_x.service
 
-# Live error logs
+# Local Gunicorn loopback test
+curl -I http://127.0.0.1:5000/api/matches
+
+# Live application error logs
 tail -f /var/log/arena_x/error.log
 ```
 
 ---
 
-## 7. Useful Operational Commands
+## 7. Official Admin Portal Access
+
+The official production administration portal URL is:
+```
+https://YOUR-DOMAIN.com/admin
+```
+- **Authentication:** Validated solely against `ARENA_ADMIN_KEY` by the backend `/api/admin/login` endpoint.
+- **Security:** All client-side fallback hashes have been completely removed.
+- **Rate Limit:** 5 failed attempts per IP per 15 minutes (HTTP 429 lockout).
+- **Session:** Secure, HttpOnly, SameSite=Lax, with CSRF protection on all state-changing endpoints.
+
+---
+
+## 8. Useful Operational Commands
 
 | Action | Command |
 | :--- | :--- |

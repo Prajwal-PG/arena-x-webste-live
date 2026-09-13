@@ -14,6 +14,10 @@ import hashlib
 from PIL import Image
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+os.environ.setdefault('SECRET_KEY', '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')
+os.environ.setdefault('ARENA_ADMIN_KEY', 'AX2026_test_organizer_key_9999')
+os.environ.setdefault('DB_PASSWORD', 'test_db_master_password_9999')
+os.environ.setdefault('SESSION_COOKIE_SECURE', 'false')
 from app import app, DB_PATH, decrypt_field, encrypt_field, MAX_SCREENSHOT_BYTES, register_attempts, login_attempts, generate_captcha, verify_captcha, SECRET_KEY, ADMIN_PASSKEY
 
 def run_cyber_security_tests():

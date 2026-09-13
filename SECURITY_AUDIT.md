@@ -64,19 +64,44 @@ All vulnerabilities and architecture risks identified during the audit were reme
 
 ### [HIGH] 4. Admin Rate Limiting & Brute-Force Protection
 - **Affected Files:** `app.py` (`is_rate_limited`, `admin_login`, `/api/admin/checkin`)
-- **Risk:** Admin endpoints could be targeted by credential stuffing or automated brute-force attacks if rate limiting only operates in a single process memory space.
+- **Risk:** Admin endpoints could be targeted by credential stuffing or automated brute-force attacks if rate limiting only operates in a single process memory space or allows unbounded attempts.
 - **Fix Implemented:**
   1. Built a dual-engine rate limiter:
-     - Redis-backed sliding-window rate limiter across multi-worker Gunicorn processes.
+     - Redis-backed sliding-window rate limiter across multi-worker Gunicorn processes (`127.0.0.1:6379`).
      - Automatic thread-safe in-memory sliding-window fallback if Redis is temporarily unreachable.
-  2. Enforced 5 login attempts per 60 seconds with automatic HTTP 429 lockout.
-  3. Enforced rate limits on `/api/admin/checkin` (60/min), `/api/pass/<qr_token>` (25/min), and `/api/register` (5 per 10 minutes).
-  4. Passkeys capped at 200 characters to prevent algorithmic DoS, and evaluated using `secrets.compare_digest()` for timing-attack resistance.
-- **Verification / Test:** Suite 3 of `tests/security_test_suite.py` verified that 8 rapid failed login attempts trigger HTTP 429 rate limit lockout.
+  2. Enforced 5 failed login attempts per 15 minutes (900 seconds) with automatic HTTP 429 lockout.
+  3. Returns generic error message `"Invalid admin credentials."` on all invalid attempts to prevent account/credential enumeration or differential timing leaks.
+  4. Enforced rate limits on `/api/admin/checkin` (60/min), `/api/pass/<qr_token>` (25/min), and `/api/register` (5 per 10 minutes).
+  5. Passkeys capped at 200 characters to prevent algorithmic DoS, and evaluated using `secrets.compare_digest()` for timing-attack resistance.
+- **Verification / Test:** Suite 3 of `tests/security_test_suite.py` verified that rapid failed login attempts trigger HTTP 429 rate limit lockout.
 
 ---
 
-### [HIGH] 5. Insecure Direct Object Reference (IDOR) & Public Data Minimization
+### [CRITICAL] 5. Elimination of Client-Side Authentication Bypasses & Static Fallback
+- **Affected Files:** `admin.html`, `app.py`
+- **Risk:** Earlier iterations contained client-side SHA-256 hash checks and `sessionStorage.setItem('arena_admin_auth', 'true')` in `admin.html` when offline or when using static previews. An attacker inspecting frontend JavaScript could locate static hashes or forge local storage flags to preview UI components.
+- **Fix Implemented:**
+  1. Completely removed `computePassHash`, client-side SHA-256 hash checks, and local/sessionStorage authentication flags.
+  2. The Flask backend route `/api/admin/login` is the sole, authoritative source of authentication, strictly comparing against `ARENA_ADMIN_KEY` from the server environment using constant-time comparison.
+  3. If backend network calls fail or the server is unreachable, the dashboard displays: `"Admin server unavailable. Please try again."` and blocks all dashboard access.
+  4. Session fixation defense: Flask backend executes `session.clear()` immediately prior to issuing authenticated session cookies.
+  5. Session cookies are configured with `HttpOnly=True`, `SameSite=Lax`, `Secure=True` in production, and a strict 2-hour sliding lifetime.
+  6. Official production admin login URL: `https://YOUR-DOMAIN.com/admin`.
+- **Verification / Test:** Verified unauthenticated requests receive HTTP 401; network disconnections render the server unavailable warning; valid login securely issues CSRF token and sets HttpOnly cookie.
+
+---
+
+### [HIGH] 6. CORS Restriction & Cloudflare Pages Regex Removal
+- **Affected Files:** `app.py` (`get_allowed_origins`)
+- **Risk:** Permitting wildcard CORS or broad subdomains (e.g. `*.pages.dev`) allows untrusted third-party sites or subdomains to send cross-origin requests and read responses if misconfigured.
+- **Fix Implemented:**
+  1. Removed `CLOUDFLARE_PAGES_PATTERN` and all wildcard matching.
+  2. CORS `Access-Control-Allow-Origin` strictly matches explicit domains declared in `ALLOWED_ORIGINS` (defaulting to `https://YOUR-DOMAIN.com,https://www.YOUR-DOMAIN.com`).
+- **Verification / Test:** Verified unauthorized origins are denied CORS access.
+
+---
+
+### [HIGH] 7. Insecure Direct Object Reference (IDOR) & Public Data Minimization
 - **Affected Files:** `app.py` (`/api/pass/<qr_token>`)
 - **Risk:** Public digital pass endpoints can leak private attendee details (phone numbers, emails, emergency contacts, database IDs) if lookups accept sequential integers (`/api/pass/1`) or return unredacted records.
 - **Fix Implemented:**
@@ -87,7 +112,7 @@ All vulnerabilities and architecture risks identified during the audit were reme
 
 ---
 
-### [MEDIUM] 6. Cross-Site Request Forgery (CSRF) & State-Changing Protections
+### [MEDIUM] 8. Cross-Site Request Forgery (CSRF) & State-Changing Protections
 - **Affected Files:** `app.py` (`validate_csrf`, `admin_required`, admin JS interceptor)
 - **Risk:** If administrative state-changing routes accept requests based solely on session cookies without anti-CSRF tokens, cross-origin sites could forge actions.
 - **Fix Implemented:**
@@ -98,7 +123,7 @@ All vulnerabilities and architecture risks identified during the audit were reme
 
 ---
 
-### [MEDIUM] 7. CSV Formula / DDE Injection
+### [MEDIUM] 9. CSV Formula / DDE Injection
 - **Affected Files:** `app.py` (`export_registrations_csv`)
 - **Risk:** Malicious users could register team names beginning with `=`, `+`, `-`, or `@` to execute arbitrary formulas or commands when administrators open exported CSV files in Microsoft Excel or LibreOffice.
 - **Fix Implemented:**
@@ -108,7 +133,7 @@ All vulnerabilities and architecture risks identified during the audit were reme
 
 ---
 
-### [MEDIUM] 8. Hostinger KVM 1 Systemd & Gunicorn Sandboxing
+### [MEDIUM] 10. Hostinger KVM 1 Systemd & Gunicorn Sandboxing
 - **Affected Files:** `deploy/arena_x.service`
 - **Risk:** Running Gunicorn with excessive workers or unconfined permissions on a 1 vCPU VPS can lead to CPU starvation, memory exhaustion, and lateral movement if the process is compromised.
 - **Fix Implemented:**
@@ -130,7 +155,7 @@ All vulnerabilities and architecture risks identified during the audit were reme
 
 ---
 
-### [LOW / INFO] 9. Production Security Headers & Nginx File Blocking
+### [LOW / INFO] 11. Production Security Headers & Nginx File Blocking
 - **Affected Files:** `app.py`, `deploy/nginx.conf`, `deploy/cloudflare_nginx.conf`
 - **Risk:** Missing security headers allow clickjacking, MIME-sniffing, and referrer leakage. Serving database files or dotfiles directly from Nginx would cause immediate information disclosure.
 - **Fix Implemented:**
@@ -151,9 +176,12 @@ All vulnerabilities and architecture risks identified during the audit were reme
 | Threat Vector | Severity | Mitigating Control | Audit Status |
 | :--- | :--- | :--- | :--- |
 | **SQL Injection** | CRITICAL | 100% Parameterized queries with SQLite WAL mode | PASSED |
+| **Client-Side Auth Bypass** | CRITICAL | Server-authoritative `/api/admin/login`, removed all JS hashes & local flags | PASSED |
+| **Session Fixation / Hijacking** | HIGH | `session.clear()` pre-login, `HttpOnly=True`, `Secure=True`, `SameSite=Lax` | PASSED |
 | **Cross-Site Scripting (XSS)** | HIGH | HTML escaping in templates, nosniff, HttpOnly cookies | PASSED |
 | **Cross-Site Request Forgery (CSRF)**| HIGH | CSPRNG session CSRF tokens + SameSite cookies | PASSED |
-| **Admin Credential Brute-Force** | HIGH | Redis-backed rate limiter (5/min lockout) + constant-time comparison | PASSED |
+| **Admin Credential Brute-Force** | HIGH | Redis rate limiter (5/15min lockout) + constant-time comparison | PASSED |
+| **Cross-Origin Data Leak (CORS)** | HIGH | Strict explicit allowlist (`ALLOWED_ORIGINS`), zero regex wildcard | PASSED |
 | **PII Data Exposure at Rest** | HIGH | Fernet authenticated encryption for contact fields | PASSED |
 | **Malicious File / Webshell Upload** | HIGH | 300 KB limit, magic-bytes, Pillow decoding, metadata stripping | PASSED |
 | **IDOR / Pass Enumeration** | HIGH | 256-bit unguessable tokens (`AX2026_...`) + public data minimization | PASSED |

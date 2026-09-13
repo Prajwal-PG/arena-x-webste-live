@@ -22,7 +22,7 @@ EXCLUDE_EXTENSIONS = {
 }
 
 EXCLUDE_EXACT_FILES = {
-    '.env', '.env.production', '.env.local', '.env.production.sample', 'debug_js.txt', 'scratch_script_0.js'
+    '.env', '.env.production', '.env.local', 'debug_js.txt', 'scratch_script_0.js'
 }
 
 def create_clean_zip(output_zip_name="arena_x_2026_clean_portal.zip"):

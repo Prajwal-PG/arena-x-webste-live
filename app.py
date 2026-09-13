@@ -125,9 +125,7 @@ ALLOWED_ORIGINS = [orig.strip() for orig in raw_origins.split(',') if orig.strip
 if not ALLOWED_ORIGINS:
     ALLOWED_ORIGINS = ['http://127.0.0.1:5000', 'http://localhost:5000']
 
-# Also permit Cloudflare Pages deployment domains
-CLOUDFLARE_PAGES_PATTERN = re.compile(r"^https://[a-zA-Z0-9-]+\.pages\.dev$")
-CORS_ORIGINS = ALLOWED_ORIGINS + [CLOUDFLARE_PAGES_PATTERN]
+CORS_ORIGINS = ALLOWED_ORIGINS
 
 CORS(
     app,
@@ -1322,19 +1320,18 @@ def register_participant():
 @app.route('/api/admin/login', methods=['POST'])
 def admin_login():
     client_ip = get_client_ip()
-    if is_rate_limited(client_ip, 'login', limit=5, window_seconds=60):
+    if is_rate_limited(client_ip, 'login', limit=5, window_seconds=900):
         app.logger.warning(f"Admin login rate limit triggered for {client_ip}")
-        return jsonify({'success': False, 'message': 'Too many failed login attempts! Please wait 1 minute before trying again.'}), 429
+        return jsonify({'success': False, 'message': 'Too many failed login attempts! Please wait 15 minutes before trying again.'}), 429
 
     data = request.get_json(silent=True) or {}
     passkey = str(data.get('passkey', '')).strip()
 
     if not passkey or len(passkey) > 200:
         app.logger.warning(f"Failed admin authentication attempt from {client_ip}")
-        return jsonify({'success': False, 'message': 'Invalid admin passkey access denied!'}), 401
+        return jsonify({'success': False, 'message': 'Invalid admin credentials.'}), 401
 
-    valid_keys = [ADMIN_PASSKEY, 'arenaxnipe.nitte.fiza']
-    if any(secrets.compare_digest(passkey, k) for k in valid_keys if k):
+    if secrets.compare_digest(passkey, ADMIN_PASSKEY):
         reset_rate_limit(client_ip, 'login')
         session.clear()
         session['is_admin'] = True
@@ -1350,7 +1347,7 @@ def admin_login():
         })
 
     app.logger.warning(f"Failed admin authentication attempt from {client_ip}")
-    return jsonify({'success': False, 'message': 'Invalid admin passkey access denied!'}), 401
+    return jsonify({'success': False, 'message': 'Invalid admin credentials.'}), 401
 
 @app.route('/api/admin/logout', methods=['POST'])
 @admin_required

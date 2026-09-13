@@ -185,7 +185,7 @@ TRUST_CLOUDFLARE_IP=true
 TRUSTED_PROXIES=127.0.0.1,::1
 
 # Strict CORS Allowlist (Your actual domains)
-ALLOWED_ORIGINS=https://yourdomain.com,https://www.yourdomain.com
+ALLOWED_ORIGINS=https://YOUR-DOMAIN.com,https://www.YOUR-DOMAIN.com
 
 # Redis Shared Rate Limiter
 REDIS_URL=redis://127.0.0.1:6379/0
@@ -241,10 +241,10 @@ ln -sf /etc/nginx/sites-available/arena_x /etc/nginx/sites-enabled/arena_x
 rm -f /etc/nginx/sites-enabled/default
 
 # Replace domain placeholders
-sed -i 's/YOUR_DOMAIN.COM/yourdomain.com/g' /etc/nginx/sites-available/arena_x
+sed -i 's/YOUR_DOMAIN.COM/YOUR-DOMAIN.com/g' /etc/nginx/sites-available/arena_x
 
 # Obtain SSL Certificate via Certbot
-certbot --nginx -d yourdomain.com -d www.yourdomain.com
+certbot --nginx -d YOUR-DOMAIN.com -d www.YOUR-DOMAIN.com
 
 nginx -t && systemctl restart nginx
 ```
@@ -261,8 +261,8 @@ cp /var/www/arena_x/deploy/cloudflare_nginx.conf /etc/nginx/sites-available/aren
 ln -sf /etc/nginx/sites-available/arena_x /etc/nginx/sites-enabled/arena_x
 rm -f /etc/nginx/sites-enabled/default
 
-# Update server_name to your domain
-sed -i 's/arenax.in/yourdomain.com/g' /etc/nginx/sites-available/arena_x
+# Update server_name to your domain (if not already YOUR-DOMAIN.com)
+sed -i 's/YOUR_DOMAIN.COM/YOUR-DOMAIN.com/g' /etc/nginx/sites-available/arena_x
 
 nginx -t && systemctl restart nginx
 ```
@@ -335,9 +335,9 @@ systemctl restart ssh
 
 Run the following smoke tests against your live deployment:
 
-1. **Homepage:** Navigate to `https://yourdomain.com`. Ensure HTTPS is active and assets load.
+1. **Homepage:** Navigate to `https://YOUR-DOMAIN.com`. Ensure HTTPS is active and assets load.
 2. **Registration:** Submit a test registration with a screenshot proof. Verify success response.
-3. **Admin Login:** Navigate to `https://yourdomain.com/admin`. Enter your `ARENA_ADMIN_KEY`. Verify dashboard loads.
+3. **Admin Login:** Navigate to `https://YOUR-DOMAIN.com/admin`. Enter your `ARENA_ADMIN_KEY`. Verify dashboard loads.
 4. **Bracket & Score Update:** Update scores and select a winner in the Live Match Manager. Verify auto-save.
 5. **CSV Export:** Click "Export CSV". Verify decrypted fields download cleanly in Excel.
 6. **Rate Limiting:** Attempt rapid invalid logins (5 attempts) to verify HTTP 429 lockout.
